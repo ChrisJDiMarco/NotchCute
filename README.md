@@ -9,7 +9,8 @@ Hover your MacBook's notch, pick a category of cute things, and the screen dims 
 - **Notch hover:** rest the pointer in the notch for ~0.3 s and a black panel grows out of it with six categories: Eye Bleach, Puppies, Kitties, Tiny Critters, Birbs, Otters & Pals.
 - **Spotlight:** click a category and everything dims except a centered window. Images stay up 8 s; videos play muted to the end.
 - **Controls:** arrow keys or space to skip, Esc / click outside / the ✕ to close.
-- **Menu bar:** a 🐾 icon offers the same categories and Quit.
+- **Why it exists:** a line under the carousel ("Research says a peek at baby animals sharpens your focus…") opens a window summarizing the research behind the app: Nittono et al. (2012, PLoS ONE), Myrick (2015), and Yoshikawa & Masaki (2021), with links to each paper.
+- **Menu bar:** a 🐾 icon offers the same categories, "Why cute things help…", and Quit.
 - **Gentle filter:** skips posts whose titles mention NSFW or sad words ("RIP", "passed away"…). Not perfect.
 - **Polite to Reddit:** uses public RSS feeds (no login), spaces requests 2.5 s apart, caches for 15 minutes and falls back to the last good copy on disk.
 

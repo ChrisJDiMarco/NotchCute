@@ -346,6 +346,88 @@ struct SpotlightView: View {
     }
 }
 
+// MARK: - Research modal
+
+struct ResearchView: View {
+    let cardSize: CGSize
+    let close: () -> Void
+    private let pink = Color(red: 1.0, green: 0.62, blue: 0.72)
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.82)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture { close() }
+
+            VStack(spacing: 0) {
+                HStack {
+                    Text("Why NotchCute exists").font(.system(size: 21, weight: .bold, design: .rounded))
+                    Spacer()
+                    Button(action: close) { Image(systemName: "xmark.circle.fill").font(.system(size: 20)) }
+                        .buttonStyle(.plain)
+                }
+                .padding(20)
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Text("I came across a study from Hiroshima University showing that a short look at baby animals makes people more careful and more focused afterward. That seemed worth having one hover away, so I built this. Here is what the research found.")
+                            .font(.system(size: 14, design: .rounded)).opacity(0.85)
+
+                        heading("The Power of Kawaii", "Nittono, Fukushima, Yano & Moriya · Hiroshima University · PLoS ONE, 2012")
+                        item("🩺  Steadier hands", "In an Operation-style tweezers game, people who first looked at puppy and kitten photos improved their scores by 43.9%. People shown adult dogs and cats improved by 11.9%. The baby-animal group slowed down and worked more carefully.")
+                        item("🔍  Sharper eyes", "In a timed number-search task, the baby-animal group improved 15.7%. Adult animals: 1.4%. Photos of tasty food: 1.2%. So it isn't just feeling good. Cuteness itself did the work.")
+                        item("🎯  Tighter focus", "Cute images made people less likely to see the big picture first and more likely to zero in on the details.")
+                        item("🧠  Why it works", "Baby features like big eyes, round faces and large heads switch on a caretaking instinct. Instead of relaxing you, that instinct makes you careful.")
+
+                        heading("Related research", "")
+                        item("🐈  Cat videos and mood", "Myrick, 2015 · Computers in Human Behavior. A survey of nearly 7,000 people found that watching cat videos online left them feeling more energetic and positive, and less anxious, annoyed and sad. These were people's own reports of how they felt.")
+                        item("🏀  Free throws under pressure", "Yoshikawa & Masaki, 2021 · Frontiers in Psychology. A smaller follow-up tested whether looking at cute pictures helps people keep their free-throw accuracy when the pressure is on.")
+
+                        heading("When to use it", "")
+                        Text("A quick look helps most before detail work: proofreading, checking numbers, careful editing. It helps less before brainstorming, because a narrower focus is the whole effect.")
+                            .font(.system(size: 14, design: .rounded)).opacity(0.85)
+
+                        heading("Read the papers", "")
+                        VStack(alignment: .leading, spacing: 8) {
+                            Link("Nittono et al. (2012), PLoS ONE ›", destination: URL(string: "https://doi.org/10.1371/journal.pone.0046362")!)
+                            Link("Myrick (2015), Computers in Human Behavior ›", destination: URL(string: "https://doi.org/10.1016/j.chb.2015.06.001")!)
+                            Link("Yoshikawa & Masaki (2021), Frontiers in Psychology ›", destination: URL(string: "https://doi.org/10.3389/fpsyg.2021.610817")!)
+                        }
+                        .font(.system(size: 13, weight: .semibold, design: .rounded))
+                        .tint(pink)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 26)
+                    .padding(.bottom, 26)
+                }
+            }
+            .foregroundColor(.white)
+            .frame(width: cardSize.width, height: cardSize.height)
+            .background(Color(white: 0.09))
+            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+            .shadow(color: .black.opacity(0.6), radius: 40)
+            .contentShape(Rectangle())
+            .onTapGesture {}
+        }
+    }
+
+    private func heading(_ title: String, _ sub: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.system(size: 16, weight: .bold, design: .rounded)).foregroundColor(pink)
+            if !sub.isEmpty { Text(sub).font(.system(size: 12, design: .rounded)).opacity(0.55) }
+        }
+        .padding(.top, 4)
+    }
+
+    private func item(_ title: String, _ body: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title).font(.system(size: 14, weight: .semibold, design: .rounded))
+            Text(body).font(.system(size: 13.5, design: .rounded)).opacity(0.8).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 // MARK: - Notch gallery
 
 @MainActor final class NotchState: ObservableObject {
@@ -356,7 +438,9 @@ struct NotchGalleryView: View {
     @ObservedObject var state: NotchState
     let notchHeight: CGFloat
     let onPick: (CuteCategory) -> Void
+    let onAbout: () -> Void
     @State private var hovered: String?
+    @State private var aboutHovered = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -368,6 +452,21 @@ struct NotchGalleryView: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 12)
             }
+            HStack(spacing: 5) {
+                Text("Research says a peek at baby animals sharpens your focus, so I put it one hover away.")
+                    .foregroundColor(.white.opacity(0.72))
+                Text("See why ›")
+                    .fontWeight(.semibold)
+                    .foregroundColor(Color(red: 1.0, green: 0.62, blue: 0.72))
+                    .underline(aboutHovered)
+            }
+            .font(.system(size: 12, design: .rounded))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 4)
+            .contentShape(Rectangle())
+            .onHover { aboutHovered = $0 }
+            .onTapGesture { onAbout() }
+            .padding(.bottom, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(
@@ -463,7 +562,7 @@ final class KeyWindow: NSWindow {
     private func showPanel(on screen: NSScreen) {
         let nh = notchHeight(screen)
         let w: CGFloat = 680
-        let h: CGFloat = nh + 140
+        let h: CGFloat = nh + 172
         let frame = NSRect(x: hotZone(screen).midX - w / 2, y: screen.frame.maxY - h, width: w, height: h)
         if panel == nil {
             let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -474,7 +573,7 @@ final class KeyWindow: NSWindow {
             p.isMovable = false
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
-            let hv = FirstMouseHostingView(rootView: NotchGalleryView(state: state, notchHeight: nh, onPick: { [weak self] c in self?.openSpotlight(c) }))
+            let hv = FirstMouseHostingView(rootView: NotchGalleryView(state: state, notchHeight: nh, onPick: { [weak self] c in self?.openSpotlight(c) }, onAbout: { [weak self] in self?.openResearch() }))
             hv.sizingOptions = []
             p.contentView = hv
             panel = p
@@ -547,6 +646,38 @@ final class KeyWindow: NSWindow {
         m.load()
     }
 
+    func openResearch() {
+        hidePanel()
+        if spotlight != nil { closeSpotlight() }
+        guard let screen = notchScreen() else { return }
+        previousApp = NSWorkspace.shared.frontmostApplication
+        let size = CGSize(width: min(640, screen.frame.width - 80), height: min(640, screen.frame.height - 120))
+        let w = KeyWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        w.setFrame(screen.frame, display: false)
+        w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
+        w.isOpaque = false
+        w.backgroundColor = .clear
+        w.hasShadow = false
+        w.isReleasedWhenClosed = false
+        w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        let hv = FirstMouseHostingView(rootView: ResearchView(cardSize: size, close: { [weak self] in self?.closeSpotlight() }))
+        hv.sizingOptions = []
+        w.contentView = hv
+        w.alphaValue = 0
+        spotlight = w
+        NSApp.activate()
+        w.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { ctx in
+            ctx.duration = 0.25
+            w.animator().alphaValue = 1
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard e.keyCode == 53 else { return e }
+            MainActor.assumeIsolated { self?.closeSpotlight() }
+            return nil
+        }
+    }
+
     func closeSpotlight() {
         if let k = keyMonitor { NSEvent.removeMonitor(k); keyMonitor = nil }
         model?.stop()
@@ -588,12 +719,16 @@ final class KeyWindow: NSWindow {
             menu.addItem(mi)
         }
         menu.addItem(.separator())
+        let why = NSMenuItem(title: "Why cute things help…", action: #selector(about), keyEquivalent: "")
+        why.target = self
+        menu.addItem(why)
         menu.addItem(NSMenuItem(title: "Quit NotchCute", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         si.menu = menu
         statusItem = si
     }
 
     @objc func pick(_ sender: NSMenuItem) { controller.openSpotlight(categories[sender.tag]) }
+    @objc func about() { controller.openResearch() }
 }
 
 @main @MainActor enum NotchCuteMain {
