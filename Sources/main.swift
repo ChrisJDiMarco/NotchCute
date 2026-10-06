@@ -1552,8 +1552,11 @@ final class KeyWindow: NSWindow {
 }
 
 /// Can take keyboard focus without activating the app, so ⌃⌥C can drive the panel while you stay in your work.
+/// Only while opened from the keyboard: a panel that can become key spends the first mouse click on becoming key,
+/// so a clicked card wouldn't open until the second click.
 final class KeyPanel: NSPanel {
-    override var canBecomeKey: Bool { true }
+    var acceptsKeyboard = false
+    override var canBecomeKey: Bool { acceptsKeyboard }
 }
 
 @MainActor final class NotchController {
@@ -1764,6 +1767,7 @@ final class KeyPanel: NSPanel {
         guard panelOpen else { return }
         if let k = panelKeyMonitor { NSEvent.removeMonitor(k); panelKeyMonitor = nil }
         keyboardPanel = false
+        panel?.acceptsKeyboard = false
         state.selected = nil
         leaveStart = nil
         hoverStart = nil
@@ -1781,6 +1785,7 @@ final class KeyPanel: NSPanel {
         openPanel(on: screen)
         keyboardPanel = true
         state.selected = boostCategory.id
+        panel?.acceptsKeyboard = true
         panel?.makeKey()
         panelKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
             let code = e.keyCode
