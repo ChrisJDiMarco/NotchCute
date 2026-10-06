@@ -2,6 +2,7 @@
 import AppKit
 import SwiftUI
 import AVFoundation
+import CoreImage
 import Carbon.HIToolbox
 import ServiceManagement
 
@@ -41,6 +42,8 @@ enum Theme {
     static let playerRadius: CGFloat = 26
     /// How long the pointer rests in the notch before the panel opens.
     static let dwell: TimeInterval = 0.32
+    /// The longer hover needed while a full-screen app is in front, so a presentation never gets surprise kittens.
+    static let deliberateDwell: TimeInterval = 1.1
     static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
     static func haptic(_ p: NSHapticFeedbackManager.FeedbackPattern = .generic) {
         NSHapticFeedbackManager.defaultPerformer.perform(p, performanceTime: .now)
@@ -60,6 +63,10 @@ enum Prefs {
         set { UserDefaults.standard.set(newValue, forKey: "boostSeconds") }
     }
     static func label(_ s: Double) -> String { s < 60 ? "\(Int(s)) s" : "\(Int(s / 60)) min" }
+    static var breakReminders: Bool {
+        get { UserDefaults.standard.bool(forKey: "breakReminders") }
+        set { UserDefaults.standard.set(newValue, forKey: "breakReminders") }
+    }
 }
 
 // MARK: - Feed
@@ -236,6 +243,8 @@ actor FeedStore {
     }
 
     func prefetch(_ url: URL) { Task { _ = await image(url) } }
+
+    func cached(_ url: URL) -> NSImage? { cache.object(forKey: url as NSURL) }
 }
 
 @MainActor final class Favorites: ObservableObject {
@@ -285,6 +294,7 @@ actor FeedStore {
     @Published private(set) var boostLeft: TimeInterval = 0
     @Published private(set) var boostDone = false
     @Published private(set) var hearts = 0
+    @Published private(set) var toast: String?
     var videoProgress: Double = 0
     var onBoostDone: (() -> Void)?
     var onBoostTick: ((TimeInterval) -> Void)?
@@ -298,10 +308,14 @@ actor FeedStore {
     private var watchdogTask: Task<Void, Never>?
     private var loadTask: Task<Void, Never>?
     private var boostTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
+    private let lead: CuteItem?
 
-    init(category: CuteCategory, boostLength: TimeInterval? = nil) {
+    /// `lead` is the post a card was showing; the player opens on it.
+    init(category: CuteCategory, boostLength: TimeInterval? = nil, lead: CuteItem? = nil) {
         self.category = category
         self.boostLength = boostLength
+        self.lead = lead
         self.boostLeft = boostLength ?? 0
     }
 
@@ -309,6 +323,7 @@ actor FeedStore {
 
     func load() {
         startBoost()
+        if let lead { merge([lead]) }
         if category.id == favoritesCategory.id {
             merge(Favorites.shared.items)
             if items.isEmpty { loadState = .empty("No favorites yet. Press F or ♥ on anything you love.") }
@@ -422,6 +437,39 @@ actor FeedStore {
         if Favorites.shared.contains(item) { hearts += 1; Theme.haptic() }
     }
 
+    /// ⌘C: the picture itself for stills, the post's link for videos.
+    func copyCurrent() {
+        guard let item = current else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        if !item.isVideo, let img = ImageCache.shared.cached(item.url) {
+            pb.writeObjects([img])
+            showToast("Image copied")
+        } else {
+            pb.setString((item.permalink ?? item.url).absoluteString, forType: .string)
+            showToast("Link copied")
+        }
+    }
+
+    /// What the share menu sends: the picture when there is one, plus a link back to the post.
+    func shareItems() -> [Any] {
+        guard let item = current else { return [] }
+        var out: [Any] = []
+        if !item.isVideo, let img = ImageCache.shared.cached(item.url) { out.append(img) }
+        out.append(item.permalink ?? item.url)
+        return out
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation(.easeOut(duration: 0.2)) { toast = text }
+        toastTask?.cancel()
+        toastTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1.4))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeIn(duration: 0.3)) { self?.toast = nil }
+        }
+    }
+
     private func startAdvance(after secs: TimeInterval) {
         advanceTask?.cancel()
         if paused { remaining = secs; deadline = nil; return }
@@ -472,7 +520,7 @@ actor FeedStore {
         }
     }
 
-    func stop() { advanceTask?.cancel(); watchdogTask?.cancel(); loadTask?.cancel(); boostTask?.cancel() }
+    func stop() { advanceTask?.cancel(); watchdogTask?.cancel(); loadTask?.cancel(); boostTask?.cancel(); toastTask?.cancel() }
 }
 
 // MARK: - Media
@@ -518,8 +566,11 @@ struct AnimatedImage: NSViewRepresentable {
 }
 
 final class PlayerNSView: NSView {
+    private static let ci = CIContext()
     private let player = AVPlayer()
     private let playerLayer = AVPlayerLayer()
+    private let seamLayer = CALayer()
+    private let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA])
     private var endObserver: NSObjectProtocol?
     private var statusObs: NSKeyValueObservation?
     private var timeObserver: Any?
@@ -542,8 +593,12 @@ final class PlayerNSView: NSView {
         playerLayer.player = player
         playerLayer.videoGravity = .resizeAspect
         layer?.addSublayer(playerLayer)
+        seamLayer.contentsGravity = .resizeAspect
+        seamLayer.opacity = 0
+        layer?.addSublayer(seamLayer)
         let asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": ["User-Agent": userAgent]])
         let item = AVPlayerItem(asset: asset)
+        item.add(output)
         player.isMuted = muted
         player.replaceCurrentItem(with: item)
         endObserver = NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak self] _ in
@@ -568,13 +623,29 @@ final class PlayerNSView: NSView {
     required init?(coder: NSCoder) { fatalError("not used") }
 
     /// Short clips loop until they've had 8 s on screen, so a 3 s GIF doesn't flash by.
+    /// Each loop crossfades out of the clip's last frame instead of jumping back to the start.
     private func reachedEnd() {
-        if let s = startedAt, Date().timeIntervalSince(s) < PlayerModel.imageSeconds {
-            player.seek(to: .zero)
-            if !paused { player.play() }
-            return
-        }
-        onEnd()
+        guard let s = startedAt, Date().timeIntervalSince(s) < PlayerModel.imageSeconds else { onEnd(); return }
+        holdLastFrame()
+        player.seek(to: .zero)
+        if !paused { player.play() }
+    }
+
+    private func holdLastFrame() {
+        guard let buf = output.copyPixelBuffer(forItemTime: player.currentTime(), itemTimeForDisplay: nil) else { return }
+        let img = CIImage(cvPixelBuffer: buf)
+        guard let cg = Self.ci.createCGImage(img, from: img.extent) else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        seamLayer.contents = cg
+        seamLayer.opacity = 0
+        CATransaction.commit()
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1
+        fade.toValue = 0
+        fade.duration = 0.45
+        fade.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        seamLayer.add(fade, forKey: "seam")
     }
 
     func apply(paused: Bool, muted: Bool) {
@@ -589,6 +660,7 @@ final class PlayerNSView: NSView {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         playerLayer.frame = bounds
+        seamLayer.frame = bounds
         CATransaction.commit()
     }
 
@@ -617,12 +689,13 @@ struct VideoMedia: NSViewRepresentable {
 }
 
 /// One post, full bleed: the media over a blurred copy of itself, so nothing letterboxes onto black.
-/// Stills drift in slowly over their eight seconds.
+/// The post's thumbnail shows at once, sharp, and the real media fades in over it. Stills drift in slowly.
 struct MediaView: View {
     let item: CuteItem
     @ObservedObject var model: PlayerModel
     @State private var image: NSImage?
-    @State private var backdrop: NSImage?
+    @State private var poster: NSImage?
+    @State private var videoReady = false
     @State private var zoomed = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -630,7 +703,7 @@ struct MediaView: View {
         ZStack {
             // In an overlay so the fill-scaled image can't make the layout wider than the card.
             Color.clear.overlay {
-                if let b = backdrop ?? image {
+                if let b = image ?? poster {
                     Image(nsImage: b).resizable().scaledToFill()
                         .blur(radius: 40, opaque: true)
                         .overlay(Color.black.opacity(0.35))
@@ -640,25 +713,39 @@ struct MediaView: View {
             .clipped()
             if item.isVideo {
                 VideoMedia(url: item.url, paused: model.paused || model.boostDone, muted: model.muted,
-                           onReady: { model.ready(item) }, onEnd: { model.ended(item) }, onFail: { model.failed(item) },
+                           onReady: { videoReady = true; model.ready(item) }, onEnd: { model.ended(item) }, onFail: { model.failed(item) },
                            onProgress: { model.videoProgressed($0, for: item) })
+                if !videoReady, let poster { still(poster).transition(.opacity) }
             } else if let image {
                 Group {
-                    if item.url.pathExtension.lowercased() == "gif" { AnimatedImage(image: image) }
-                    else { Image(nsImage: image).resizable().interpolation(.high).scaledToFit() }
+                    if item.url.pathExtension.lowercased() == "gif" { AnimatedImage(image: image) } else { still(image) }
                 }
                 .scaleEffect(zoomed ? 1.06 : 1)
+                .transition(.opacity)
+            } else if let poster {
+                still(poster).transition(.opacity)
             }
         }
+        .animation(.easeOut(duration: 0.35), value: videoReady)
+        .animation(.easeOut(duration: 0.35), value: image != nil)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(Text(item.title))
+        .accessibilityAddTraits(.isImage)
         .task { await load() }
     }
 
+    private func still(_ img: NSImage) -> some View {
+        Image(nsImage: img).resizable().interpolation(.high).scaledToFit()
+    }
+
     private func load() async {
+        if let t = item.thumb { poster = ImageCache.shared.cached(t) }
+        if let p = poster { await applyTint(p) }
         if item.isVideo {
-            guard let t = item.thumb, let img = await ImageCache.shared.image(t) else { return }
-            withAnimation(.easeOut(duration: 0.3)) { backdrop = img }
+            guard poster == nil, let t = item.thumb, let img = await ImageCache.shared.image(t) else { return }
+            poster = img
             await applyTint(img)
             return
         }
@@ -666,13 +753,14 @@ struct MediaView: View {
         image = img
         model.ready(item)
         if !reduceMotion { withAnimation(.linear(duration: PlayerModel.imageSeconds + 1)) { zoomed = true } }
-        await applyTint(img)
+        if poster == nil { await applyTint(img) }
     }
 
     private func applyTint(_ img: NSImage) async {
         if let c = await Task.detached(priority: .utility, operation: { img.glowColor }).value { model.tint(c, for: item) }
     }
 }
+
 
 // MARK: - Spotlight
 
@@ -746,6 +834,7 @@ struct SpotlightView: View {
     @ObservedObject var favorites = Favorites.shared
     let close: () -> Void
     let open: (URL) -> Void
+    let onShare: () -> Void
     @State private var chrome = true
     @State private var activity = Activity()
     @State private var overControls = false
@@ -765,6 +854,17 @@ struct SpotlightView: View {
             .animation(Theme.fade, value: model.current?.url)
             scrims
             chromeLayer
+            if let t = model.toast {
+                Text(t)
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .modifier(GlassCapsule())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                    .padding(.top, 64)
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .allowsHitTesting(false)
+            }
             if model.boostDone { doneOverlay.transition(.opacity) }
         }
         .foregroundColor(.white)
@@ -828,8 +928,11 @@ struct SpotlightView: View {
                     .animation(.linear(duration: 0.1), value: model.boostLeft)
                 Text(clock(model.boostLeft)).font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit().opacity(0.85)
             }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Focus Boost, \(Int(model.boostLeft.rounded(.up))) seconds left")
         } else {
             StorySegments(model: model, paused: !chromeShown)
+                .accessibilityHidden(true)
         }
     }
 
@@ -855,6 +958,8 @@ struct SpotlightView: View {
                 .contentShape(Rectangle())
                 .onTapGesture { if let p = item.permalink { open(p) } }
                 .help(item.permalink == nil ? "" : "Open this post on Reddit (O)")
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(item.permalink == nil ? [] : .isLink)
             }
             Spacer(minLength: 12)
             controls
@@ -865,17 +970,22 @@ struct SpotlightView: View {
         HStack(spacing: 2) {
             if let item = model.current {
                 let fav = favorites.contains(item)
-                PillButton(symbol: fav ? "heart.fill" : "heart", tint: fav ? Theme.pink : .white, help: "Favorite (F)", bounce: model.hearts) {
+                PillButton(symbol: fav ? "heart.fill" : "heart", tint: fav ? Theme.pink : .white,
+                           label: fav ? "Remove from favorites" : "Favorite", shortcut: "F", bounce: model.hearts) {
                     model.toggleFavorite()
                 }
                 .overlay { if model.hearts > 0 { HeartBurst().id(model.hearts) } }
                 if item.isVideo {
-                    PillButton(symbol: model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: "Sound (M)") { model.muted.toggle() }
+                    PillButton(symbol: model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill",
+                               label: model.muted ? "Turn sound on" : "Mute", shortcut: "M") { model.muted.toggle() }
                 }
+                ShareControl(items: { model.shareItems() }, onChoose: onShare)
             }
-            PillButton(symbol: model.paused ? "play.fill" : "pause.fill", help: model.paused ? "Resume (Space)" : "Pause (Space)") { model.togglePause() }
-            PillButton(symbol: "chevron.left", help: "Previous (←)") { model.prev() }
-            PillButton(symbol: "chevron.right", help: "Next (→)") { model.next() }
+            PillButton(symbol: model.paused ? "play.fill" : "pause.fill", label: model.paused ? "Resume" : "Pause", shortcut: "Space") {
+                model.togglePause()
+            }
+            PillButton(symbol: "chevron.left", label: "Previous", shortcut: "←") { model.prev() }
+            PillButton(symbol: "chevron.right", label: "Next", shortcut: "→") { model.next() }
         }
         .padding(4)
         .modifier(GlassCapsule())
@@ -913,8 +1023,10 @@ struct SpotlightView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color.black.opacity(0.62))
+        .accessibilityElement(children: .combine)
     }
 }
+
 
 /// A short window of story-style segments around the current post; the current one fills as it plays.
 struct StorySegments: View {
@@ -945,7 +1057,8 @@ struct StorySegments: View {
 struct PillButton: View {
     let symbol: String
     var tint: Color = .white
-    let help: String
+    let label: String
+    var shortcut: String? = nil
     var bounce = 0
     let action: () -> Void
     @State private var hover = false
@@ -963,7 +1076,8 @@ struct PillButton: View {
         }
         .buttonStyle(.plain)
         .onHover { hover = $0 }
-        .help(help)
+        .help(shortcut.map { "\(label) (\($0))" } ?? label)
+        .accessibilityLabel(label)
     }
 }
 
@@ -982,8 +1096,64 @@ struct CloseButton: View {
         .buttonStyle(.plain)
         .onHover { hover = $0 }
         .help("Close (Esc)")
+        .accessibilityLabel("Close")
     }
 }
+
+/// The system share menu (Messages, AirDrop, Mail…), anchored to a real AppKit button so it can pop up from the pill.
+final class ShareNSButton: NSButton, NSSharingServicePickerDelegate {
+    var items: () -> [Any] = { [] }
+    var onChoose: () -> Void = {}
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        isBordered = false
+        imagePosition = .imageOnly
+        image = NSImage(systemSymbolName: "square.and.arrow.up", accessibilityDescription: "Share")?
+            .withSymbolConfiguration(.init(pointSize: 13, weight: .semibold))
+        contentTintColor = .white
+        target = self
+        action = #selector(share)
+        setAccessibilityLabel("Share")
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    @objc private func share() {
+        let picker = NSSharingServicePicker(items: items())
+        picker.delegate = self
+        picker.show(relativeTo: bounds, of: self, preferredEdge: .maxY)
+    }
+
+    func sharingServicePicker(_ picker: NSSharingServicePicker, didChoose service: NSSharingService?) {
+        if service != nil { onChoose() }
+    }
+}
+
+struct ShareButton: NSViewRepresentable {
+    let items: () -> [Any]
+    let onChoose: () -> Void
+    func makeNSView(context: Context) -> ShareNSButton { ShareNSButton(frame: .zero) }
+    func updateNSView(_ b: ShareNSButton, context: Context) {
+        b.items = items
+        b.onChoose = onChoose
+    }
+}
+
+struct ShareControl: View {
+    let items: () -> [Any]
+    let onChoose: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        ShareButton(items: items, onChoose: onChoose)
+            .frame(width: 32, height: 32)
+            .background(Circle().fill(Color.white.opacity(hover ? 0.16 : 0)))
+            .onHover { hover = $0 }
+            .help("Share (⌘C copies)")
+    }
+}
+
 
 struct GlassCapsule: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -1122,16 +1292,29 @@ struct ResearchView: View {
 
 // MARK: - Notch gallery
 
-/// hidden: tucked behind the notch. peek: you're hovering and it's about to open. open: the gallery.
-/// glow: a pink pulse when a Focus Boost lands back in the notch.
-enum NotchPhase { case hidden, peek, open, glow }
+/// hidden: tucked behind the notch. peek: you're hovering and it's about to open. nudge: an optional break
+/// reminder, the eyes peeking out on their own. open: the gallery. glow: a Focus Boost landing back in the notch.
+enum NotchPhase { case hidden, peek, nudge, open, glow }
 
 @MainActor final class NotchState: ObservableObject {
     @Published var phase = NotchPhase.hidden
     @Published var thumbs: [String: NSImage] = [:]
+    /// The post each card's thumbnail came from, so picking the card opens on that same post.
+    var thumbItems: [String: CuteItem] = [:]
+    @Published var favoriteStack: [NSImage] = []
     @Published var notchSize = CGSize(width: 180, height: 0)
     @Published var panelSize = CGSize(width: 700, height: 200)
     @Published var notchHeight: CGFloat = 32
+    @Published var dwell = Theme.dwell
+    /// Where the pointer sits across the notch, -1 (left) to 1 (right), for the eyes to follow.
+    @Published var gaze: CGFloat = 0
+    /// The card chosen with the keyboard.
+    @Published var selected: String?
+}
+
+/// The panel's cards in order: Focus Boost, the categories, then Favorites once there are any.
+@MainActor func panelCards() -> [CuteCategory] {
+    [boostCategory] + categories + (Favorites.shared.items.isEmpty ? [] : [favoritesCategory])
 }
 
 let cardWidth: CGFloat = 96
@@ -1155,8 +1338,11 @@ struct NotchGalleryView: View {
         let shape = UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: r, bottomTrailingRadius: r, topTrailingRadius: 0, style: .continuous)
         ZStack(alignment: .top) {
             content.frame(width: state.panelSize.width, height: state.panelSize.height, alignment: .top)
-            if state.phase == .peek {
-                PeekFace().frame(width: size.width, height: size.height).transition(.opacity)
+            if state.phase == .peek || state.phase == .nudge {
+                PeekFace(dwell: state.dwell, nudge: state.phase == .nudge, gaze: state.gaze)
+                    .id(state.phase == .nudge)
+                    .frame(width: size.width, height: size.height)
+                    .transition(.opacity)
             }
         }
         .frame(width: size.width, height: size.height, alignment: .top)
@@ -1170,7 +1356,7 @@ struct NotchGalleryView: View {
         let n = state.notchSize
         switch state.phase {
         case .open: return state.panelSize
-        case .peek: return CGSize(width: n.width + 28, height: n.height + 18)
+        case .peek, .nudge: return CGSize(width: n.width + 28, height: n.height + 18)
         case .glow: return CGSize(width: n.width + 10, height: max(n.height, 6) + 4)
         case .hidden: return n
         }
@@ -1181,8 +1367,7 @@ struct NotchGalleryView: View {
             Spacer().frame(height: state.notchHeight)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: cardSpacing) {
-                    let cards = [boostCategory] + categories + (favorites.items.isEmpty ? [] : [favoritesCategory])
-                    ForEach(Array(cards.enumerated()), id: \.element.id) { i, c in
+                    ForEach(Array(panelCards().enumerated()), id: \.element.id) { i, c in
                         card(c)
                             .opacity(open ? 1 : 0)
                             .offset(y: open || reduceMotion ? 0 : -14)
@@ -1210,6 +1395,8 @@ struct NotchGalleryView: View {
             .padding(.bottom, 12)
             .opacity(open ? 1 : 0)
             .animation(open ? .easeOut(duration: 0.3).delay(0.25) : .easeIn(duration: 0.1), value: open)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isButton)
         }
     }
 
@@ -1220,24 +1407,25 @@ struct NotchGalleryView: View {
     }
 
     private func card(_ c: CuteCategory) -> some View {
-        let isHovered = hovered == c.id
+        let lit = hovered == c.id || state.selected == c.id
         let accent = c.id == boostCategory.id
         let shape = RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
         return ZStack(alignment: .bottomLeading) {
             if accent {
                 LinearGradient(colors: [Theme.pink, Theme.pinkDeep], startPoint: .topLeading, endPoint: .bottomTrailing)
             } else {
-                Color.white.opacity(isHovered ? 0.2 : 0.08)
+                Color.white.opacity(lit ? 0.2 : 0.08)
             }
-            if !accent, let t = state.thumbs[c.id] {
+            if c.id == favoritesCategory.id, !state.favoriteStack.isEmpty {
+                FavoriteStack(images: state.favoriteStack, fanned: lit)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .offset(y: -14)
+                cornerLabel(c)
+            } else if !accent, let t = state.thumbs[c.id] {
                 Image(nsImage: t).resizable().scaledToFill().frame(width: cardWidth, height: 112).clipped()
-                    .scaleEffect(isHovered ? 1.08 : 1)
+                    .scaleEffect(lit ? 1.08 : 1)
                 LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(c.emoji).font(.system(size: 18))
-                    Text(c.name).font(.system(size: 12, weight: .semibold, design: .rounded)).lineLimit(1)
-                }
-                .padding(8)
+                cornerLabel(c)
             } else {
                 VStack(spacing: 5) {
                     Text(c.emoji).font(.system(size: 40))
@@ -1250,18 +1438,63 @@ struct NotchGalleryView: View {
         .foregroundColor(.white)
         .frame(width: cardWidth, height: 112)
         .clipShape(shape)
-        .overlay(shape.strokeBorder(Color.white.opacity(isHovered ? 0.55 : 0), lineWidth: 1.5))
+        .overlay(shape.strokeBorder(Color.white.opacity(lit ? 0.55 : 0), lineWidth: 1.5))
         .overlay(GeometryReader { g in
             Color.clear.contentShape(Rectangle()).onTapGesture { onPick(c, g.frame(in: .global)) }
         })
-        .scaleEffect(isHovered ? 1.06 : 1)
-        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: hovered)
+        .scaleEffect(lit ? 1.06 : 1)
+        .animation(.spring(response: 0.25, dampingFraction: 0.7), value: lit)
         .onHover { h in if h { hovered = c.id } else if hovered == c.id { hovered = nil } }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(c.name + (sub(for: c).map { ", \($0)" } ?? ""))
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAction { onPick(c, nil) }
+    }
+
+    private func cornerLabel(_ c: CuteCategory) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(c.emoji).font(.system(size: 18))
+            HStack(spacing: 4) {
+                Text(c.name).font(.system(size: 12, weight: .semibold, design: .rounded)).lineLimit(1)
+                if c.id == favoritesCategory.id, let sub = sub(for: c) {
+                    Text(sub).font(.system(size: 11, weight: .medium, design: .rounded)).opacity(0.7)
+                }
+            }
+        }
+        .padding(8)
+    }
+}
+
+/// Up to three saved posts, fanned like photos on a table, the newest pick in front. They spread a little on hover.
+struct FavoriteStack: View {
+    let images: [NSImage]
+    let fanned: Bool
+
+    var body: some View {
+        let n = min(images.count, 3)
+        // Draw the sides first so the first image sits on top in the middle.
+        let slots: [(image: Int, pos: Double)] = n == 3 ? [(1, -1), (2, 1), (0, 0)] : n == 2 ? [(1, -0.5), (0, 0.5)] : [(0, 0)]
+        ZStack {
+            ForEach(0..<slots.count, id: \.self) { k in
+                let s = slots[k]
+                Image(nsImage: images[s.image]).resizable().scaledToFill()
+                    .frame(width: 46, height: 56)
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).strokeBorder(Color.white.opacity(0.9), lineWidth: 1.5))
+                    .shadow(color: .black.opacity(0.45), radius: 4, y: 2)
+                    .rotationEffect(.degrees(s.pos * (fanned ? 13 : 8)))
+                    .offset(x: s.pos * (fanned ? 17 : 11), y: abs(s.pos) * 3)
+            }
+        }
     }
 }
 
 /// Two eyes and a filling line under the notch while the pointer rests there: it noticed you, and it's opening.
+/// The eyes follow the pointer. As a break reminder (`nudge`) they just peek out and blink, with no line.
 struct PeekFace: View {
+    let dwell: TimeInterval
+    let nudge: Bool
+    let gaze: CGFloat
     @State private var shown = false
     @State private var blink = false
     @State private var fill = false
@@ -1270,23 +1503,30 @@ struct PeekFace: View {
     var body: some View {
         VStack(spacing: 2) {
             Spacer(minLength: 0)
-            HStack(spacing: 14) { eye; eye }.frame(height: 8)
+            HStack(spacing: 14) { eye; eye }
+                .frame(height: 8)
+                .offset(x: gaze * 5)
+                .animation(.easeOut(duration: 0.15), value: gaze)
             GeometryReader { g in
                 Capsule().fill(Theme.pink).frame(width: fill ? g.size.width : 0, height: 2)
             }
             .frame(height: 2)
             .padding(.horizontal, 16)
             .padding(.bottom, 4)
+            .opacity(nudge ? 0 : 1)
         }
         .onAppear {
             withAnimation(.spring(response: 0.22, dampingFraction: 0.6)) { shown = true }
-            withAnimation(.linear(duration: Theme.dwell)) { fill = true }
+            if !nudge { withAnimation(.linear(duration: dwell)) { fill = true } }
             guard !reduceMotion else { return }
+            let waits = nudge ? [0.7, 1.1, 0.2] : [min(dwell, Theme.dwell) * 0.5]
             Task {
-                try? await Task.sleep(for: .seconds(Theme.dwell * 0.5))
-                withAnimation(.easeInOut(duration: 0.06)) { blink = true }
-                try? await Task.sleep(for: .seconds(0.09))
-                withAnimation(.easeInOut(duration: 0.08)) { blink = false }
+                for w in waits {
+                    try? await Task.sleep(for: .seconds(w))
+                    withAnimation(.easeInOut(duration: 0.06)) { blink = true }
+                    try? await Task.sleep(for: .seconds(0.09))
+                    withAnimation(.easeInOut(duration: 0.08)) { blink = false }
+                }
             }
         }
     }
@@ -1299,6 +1539,7 @@ struct PeekFace: View {
     }
 }
 
+
 // MARK: - Windows
 
 final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
@@ -1310,20 +1551,32 @@ final class KeyWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 }
 
+/// Can take keyboard focus without activating the app, so ⌃⌥C can drive the panel while you stay in your work.
+final class KeyPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
 @MainActor final class NotchController {
-    private var panel: NSPanel?
+    private var panel: KeyPanel?
     private var openRect = NSRect.zero
     private var spotlight: NSWindow?
     private var overlay: OverlayState?
     private var model: PlayerModel?
-    private var keyMonitor: Any?
+    private var overlayMonitors: [Any] = []
+    private var panelKeyMonitor: Any?
+    private var keyboardPanel = false
     private var mouseMonitors: [Any] = []
     private var previousApp: NSRunningApplication?
     private var timer: Timer?
     private var hoverStart: Date?
+    private var hoverDwell = Theme.dwell
     private var leaveStart: Date?
     private var cooldownUntil = Date.distantPast
     private var warmTask: Task<Void, Never>?
+    private var reminderTimer: Timer?
+    private var activeMinutes = 0
+    private var swipeTravel: CGFloat = 0
+    private var swipeFired = false
     private let state = NotchState()
     /// Remaining Focus Boost time for the menu bar, or nil when none is running.
     var statusTick: ((TimeInterval?) -> Void)?
@@ -1339,7 +1592,15 @@ final class KeyWindow: NSWindow {
             MainActor.assumeIsolated { self?.tick() }
             return e
         }) { mouseMonitors.append(l) }
+        NotificationCenter.default.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] n in
+            let window = n.object as AnyObject?
+            MainActor.assumeIsolated {
+                guard let self, self.keyboardPanel, window === self.panel else { return }
+                self.hidePanel()
+            }
+        }
         warm()
+        scheduleReminders()
     }
 
     private func notchScreen() -> NSScreen? {
@@ -1379,19 +1640,45 @@ final class KeyWindow: NSWindow {
         CGRect(x: r.minX - s.frame.minX, y: s.frame.maxY - r.maxY, width: r.width, height: r.height)
     }
 
+    /// True when the front app fills this screen: a full-screen app, a slideshow, a shared screen, a game.
+    /// Then the notch waits for a longer, deliberate hover. Window bounds need no Screen Recording permission.
+    private func frontAppIsFullScreen(on s: NSScreen) -> Bool {
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier, pid != getpid(),
+              let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+        let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
+        for w in list {
+            guard (w[kCGWindowOwnerPID as String] as? pid_t) == pid, (w[kCGWindowLayer as String] as? Int) == 0,
+                  let d = w[kCGWindowBounds as String] as? NSDictionary, let b = CGRect(dictionaryRepresentation: d as CFDictionary)
+            else { continue }
+            let r = CGRect(x: b.minX, y: primaryHeight - b.maxY, width: b.width, height: b.height)
+            if r.width >= s.frame.width - 1, r.height >= s.frame.height - 1, r.intersects(s.frame) { return true }
+        }
+        return false
+    }
+
     private func tick() {
         defer { updateTimer() }
         guard spotlight == nil, let screen = notchScreen() else { return }
         let p = NSEvent.mouseLocation
         let hot = hotZone(screen)
         if panelOpen {
+            if keyboardPanel { return }
             let inside = openRect.insetBy(dx: -8, dy: -8).contains(p) || hot.contains(p)
             if inside { leaveStart = nil }
             else if let s = leaveStart { if Date().timeIntervalSince(s) > 0.35 { hidePanel() } }
             else { leaveStart = Date() }
         } else if hot.contains(p) && Date() > cooldownUntil {
-            if let s = hoverStart { if Date().timeIntervalSince(s) > Theme.dwell { openPanel(on: screen) } }
-            else { hoverStart = Date(); peek(on: screen) }
+            let gaze = max(-1, min(1, (p.x - hot.midX) / max(1, hot.width / 2)))
+            if let s = hoverStart {
+                if Date().timeIntervalSince(s) > hoverDwell { openPanel(on: screen) }
+                else if abs(gaze - state.gaze) > 0.03 { state.gaze = gaze }
+            } else {
+                hoverStart = Date()
+                hoverDwell = frontAppIsFullScreen(on: screen) ? Theme.deliberateDwell : Theme.dwell
+                state.gaze = gaze
+                peek(on: screen)
+            }
         } else if hoverStart != nil {
             hoverStart = nil
             unpeek()
@@ -1417,7 +1704,7 @@ final class KeyWindow: NSWindow {
     private func preparePanel(on screen: NSScreen) {
         let nh = notchHeight(screen)
         let notch = notchRect(screen)
-        let cards = CGFloat(categories.count + 1 + (Favorites.shared.items.isEmpty ? 0 : 1))
+        let cards = CGFloat(panelCards().count)
         let w = min(max(cards * cardWidth + (cards - 1) * cardSpacing + 36, 640), screen.frame.width - 80)
         let h = nh + 172
         state.notchSize = CGSize(width: notch.width, height: screen.safeAreaInsets.top)
@@ -1427,7 +1714,7 @@ final class KeyWindow: NSWindow {
         let margin: CGFloat = 40  // room for the glow
         let frame = NSRect(x: openRect.minX - margin, y: openRect.minY - margin, width: w + margin * 2, height: h + margin)
         if panel == nil {
-            let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+            let p = KeyPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
             p.isOpaque = false
             p.backgroundColor = .clear
@@ -1448,6 +1735,7 @@ final class KeyWindow: NSWindow {
 
     private func peek(on screen: NSScreen) {
         preparePanel(on: screen)
+        state.dwell = hoverDwell
         panel?.ignoresMouseEvents = true
         panel?.orderFrontRegardless()
         withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) { state.phase = .peek }
@@ -1474,11 +1762,46 @@ final class KeyWindow: NSWindow {
 
     private func hidePanel() {
         guard panelOpen else { return }
+        if let k = panelKeyMonitor { NSEvent.removeMonitor(k); panelKeyMonitor = nil }
+        keyboardPanel = false
+        state.selected = nil
         leaveStart = nil
         hoverStart = nil
         panel?.ignoresMouseEvents = true
         withAnimation(Theme.reduceMotion ? .easeIn(duration: 0.12) : Theme.settle) { state.phase = .hidden }
         orderOutPanel(after: 0.35)
+    }
+
+    /// ⌃⌥C: opens the panel for the keyboard (← → or 1–8 to choose, Return to open, Esc to close),
+    /// or closes whatever is already open.
+    func toggleFromHotkey() {
+        if spotlight != nil { closeSpotlight(); return }
+        if panelOpen { hidePanel(); return }
+        guard let screen = notchScreen() else { return }
+        openPanel(on: screen)
+        keyboardPanel = true
+        state.selected = boostCategory.id
+        panel?.makeKey()
+        panelKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            let code = e.keyCode
+            return MainActor.assumeIsolated { self?.panelKey(code) ?? false } ? nil : e
+        }
+    }
+
+    private func panelKey(_ code: UInt16) -> Bool {
+        let cards = panelCards()
+        let i = cards.firstIndex { $0.id == state.selected } ?? 0
+        let digits: [UInt16] = [18, 19, 20, 21, 23, 22, 26, 28]  // 1–8 on the number row
+        switch code {
+        case 123: state.selected = cards[max(0, i - 1)].id
+        case 124: state.selected = cards[min(cards.count - 1, i + 1)].id
+        case 36, 76: pick(cards[i], from: nil)
+        case 53: hidePanel()
+        default:
+            guard let n = digits.firstIndex(of: code), n < cards.count else { return false }
+            pick(cards[n], from: nil)
+        }
+        return true
     }
 
     /// A pink pulse around the notch when a Focus Boost lands back in it.
@@ -1507,7 +1830,43 @@ final class KeyWindow: NSWindow {
     private func pick(_ c: CuteCategory, from r: CGRect?) {
         Theme.haptic()
         let origin = r.flatMap { r in panel.map { NSRect(x: $0.frame.minX + r.minX, y: $0.frame.maxY - r.maxY, width: r.width, height: r.height) } }
-        if c.id == boostCategory.id { openBoost(from: origin) } else { openSpotlight(c, from: origin) }
+        if c.id == boostCategory.id { openBoost(from: origin) } else { openSpotlight(c, from: origin, lead: state.thumbItems[c.id]) }
+    }
+
+    // MARK: Break reminders
+
+    /// Opt-in. Once a minute, counts minutes of steady input; after about 50, the notch's eyes peek out and blink
+    /// once. No notification, no sound. Five idle minutes, or opening the player, resets the count.
+    func scheduleReminders() {
+        reminderTimer?.invalidate()
+        reminderTimer = nil
+        activeMinutes = 0
+        guard Prefs.breakReminders else { return }
+        let t = Timer(timeInterval: 60, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.minuteTick() }
+        }
+        t.tolerance = 10
+        RunLoop.main.add(t, forMode: .common)
+        reminderTimer = t
+    }
+
+    private func minuteTick() {
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        if idle > 300 { activeMinutes = 0; return }
+        if idle < 120 { activeMinutes += 1 }
+        guard activeMinutes >= 50, spotlight == nil, state.phase == .hidden,
+              let s = notchScreen(), !frontAppIsFullScreen(on: s) else { return }
+        activeMinutes = 0
+        preparePanel(on: s)
+        panel?.ignoresMouseEvents = true
+        panel?.orderFrontRegardless()
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) { state.phase = .nudge }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(3.2))
+            guard let self, self.state.phase == .nudge else { return }
+            withAnimation(.easeIn(duration: 0.3)) { self.state.phase = .hidden }
+            self.orderOutPanel(after: 0.35)
+        }
     }
 
     // MARK: Background feeds and card thumbnails
@@ -1535,28 +1894,42 @@ final class KeyWindow: NSWindow {
     private func refreshThumbs() {
         Task { [weak self] in
             for c in categories { await self?.refreshThumb(c) }
-            await self?.refreshThumb(favoritesCategory)
+            await self?.refreshFavoriteStack()
         }
     }
 
+    /// Each card shows a post you haven't seen yet when there is one, and remembers which post it was.
     private func refreshThumb(_ c: CuteCategory) async {
-        let items: [CuteItem]
-        if c.id == favoritesCategory.id { items = Favorites.shared.items } else { items = await FeedStore.shared.cached(c).items }
-        guard let u = items.compactMap(\.thumb).randomElement(), let img = await ImageCache.shared.image(u) else { return }
+        let items = await FeedStore.shared.cached(c).items.filter { $0.thumb != nil }
+        let unseen = items.filter { !Seen.contains($0.url) }
+        guard let post = (unseen.isEmpty ? items : unseen).randomElement(), let u = post.thumb,
+              let img = await ImageCache.shared.image(u) else { return }
         state.thumbs[c.id] = img
+        state.thumbItems[c.id] = post
+    }
+
+    private func refreshFavoriteStack() async {
+        var posts: [CuteItem] = []
+        var images: [NSImage] = []
+        for post in Favorites.shared.items.filter({ $0.thumb != nil }).shuffled() where images.count < 3 {
+            if let u = post.thumb, let img = await ImageCache.shared.image(u) { posts.append(post); images.append(img) }
+        }
+        state.favoriteStack = images
+        state.thumbItems[favoritesCategory.id] = posts.first
     }
 
     // MARK: Overlays
 
-    func openSpotlight(_ c: CuteCategory, from origin: NSRect? = nil) { openPlayer(PlayerModel(category: c), from: origin) }
+    func openSpotlight(_ c: CuteCategory, from origin: NSRect? = nil, lead: CuteItem? = nil) {
+        openPlayer(PlayerModel(category: c, lead: lead), from: origin)
+    }
 
     func openBoost(from origin: NSRect? = nil) {
         openPlayer(PlayerModel(category: boostCategory, boostLength: Prefs.boostSeconds), from: origin)
     }
 
-    func toggleBoost() { if spotlight != nil { closeSpotlight() } else { openBoost() } }
-
     private func openPlayer(_ m: PlayerModel, from origin: NSRect?) {
+        activeMinutes = 0
         m.onBoostDone = { [weak self, weak m] in
             guard let self, let m, self.model === m else { return }
             self.closeSpotlight(glow: true)
@@ -1565,9 +1938,16 @@ final class KeyWindow: NSWindow {
         let ov = presentOverlay(from: origin, maxSize: CGSize(width: 880, height: 680), content: { [weak self] _ in
             SpotlightView(model: m,
                           close: { self?.closeSpotlight() },
-                          open: { url in self?.closeSpotlight(); NSWorkspace.shared.open(url) })
-        }, keys: { [weak self] code in
+                          open: { url in self?.closeSpotlight(); NSWorkspace.shared.open(url) },
+                          onShare: { self?.closeSpotlight(reactivate: false) })
+        }, keys: { [weak self] code, mods in
             guard let self, let m = self.model else { return false }
+            if mods.contains(.command) {
+                guard code == 8 else { return false }  // ⌘C
+                m.copyCurrent()
+                return true
+            }
+            if !mods.intersection([.control, .option]).isEmpty { return false }
             switch code {
             case 53: self.closeSpotlight()
             case 124: m.next()
@@ -1581,14 +1961,31 @@ final class KeyWindow: NSWindow {
             return true
         })
         m.onTint = { [weak ov] c in ov?.setTint(c) }
+        if let s = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel, handler: { [weak self] e in
+            MainActor.assumeIsolated { self?.swipe(e) }
+            return e
+        }) { overlayMonitors.append(s) }
         model = m
         m.load()
+    }
+
+    /// A two-finger swipe moves between posts: fingers left for the next one, right for the previous.
+    private func swipe(_ e: NSEvent) {
+        guard e.hasPreciseScrollingDeltas, let m = model else { return }
+        if e.phase == .began { swipeTravel = 0; swipeFired = false }
+        guard e.phase == .changed, !swipeFired else { return }
+        let fingers = e.isDirectionInvertedFromDevice ? e.scrollingDeltaX : -e.scrollingDeltaX
+        swipeTravel += fingers
+        guard abs(swipeTravel) > 60 else { return }
+        swipeFired = true
+        if swipeTravel < 0 { m.next() } else { m.prev() }
+        Theme.haptic(.alignment)
     }
 
     func openResearch() {
         presentOverlay(from: nil, maxSize: CGSize(width: 640, height: 640), content: { [weak self] _ in
             ResearchView(close: { self?.closeSpotlight() })
-        }, keys: { [weak self] code in
+        }, keys: { [weak self] code, _ in
             guard code == 53 else { return false }
             self?.closeSpotlight()
             return true
@@ -1597,7 +1994,7 @@ final class KeyWindow: NSWindow {
 
     @discardableResult
     private func presentOverlay<V: View>(from origin: NSRect?, maxSize: CGSize, content: (CGSize) -> V,
-                                         keys: @escaping @MainActor (UInt16) -> Bool) -> OverlayState? {
+                                         keys: @escaping @MainActor (UInt16, NSEvent.ModifierFlags) -> Bool) -> OverlayState? {
         hidePanel()
         if spotlight != nil { closeSpotlight() }
         guard let screen = overlayScreen() else { return nil }
@@ -1624,17 +2021,19 @@ final class KeyWindow: NSWindow {
             try? await Task.sleep(for: .milliseconds(16))
             withAnimation(Theme.reduceMotion ? .easeOut(duration: 0.2) : Theme.open) { ov.presented = true }
         }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
-            if !e.modifierFlags.intersection([.command, .control, .option]).isEmpty { return e }
+        if let k = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { e in
             let code = e.keyCode
-            return MainActor.assumeIsolated { keys(code) } ? nil : e
-        }
+            let mods = e.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            return MainActor.assumeIsolated { keys(code, mods) } ? nil : e
+        }) { overlayMonitors.append(k) }
         return ov
     }
 
     /// Shrinks the card back into the notch; after a finished Focus Boost the notch glows as it lands.
-    func closeSpotlight(glow: Bool = false) {
-        if let k = keyMonitor { NSEvent.removeMonitor(k); keyMonitor = nil }
+    /// When a share was chosen, NotchCute stays in front so the share sheet can appear.
+    func closeSpotlight(glow: Bool = false, reactivate: Bool = true) {
+        overlayMonitors.forEach(NSEvent.removeMonitor)
+        overlayMonitors = []
         model?.stop()
         model = nil
         statusTick?(nil)
@@ -1650,9 +2049,10 @@ final class KeyWindow: NSWindow {
             w.orderOut(nil)
             if glow { self?.glowNotch() }
         }
-        previousApp?.activate(options: [])
+        if reactivate { previousApp?.activate(options: []) }
     }
 }
+
 
 // MARK: - Global hotkey
 
@@ -1701,7 +2101,7 @@ final class HotKey {
         si.menu = menu
         statusItem = si
         controller.statusTick = { [weak self] left in self?.showCountdown(left) }
-        hotKey = HotKey(keyCode: kVK_ANSI_C, modifiers: controlKey | optionKey) { [weak self] in self?.controller.toggleBoost() }
+        hotKey = HotKey(keyCode: kVK_ANSI_C, modifiers: controlKey | optionKey) { [weak self] in self?.controller.toggleFromHotkey() }
     }
 
     /// During a Focus Boost the paw carries the time left.
@@ -1715,12 +2115,10 @@ final class HotKey {
     /// Rebuilt on every open so Favorites, Launch at Login and the boost length stay current.
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let header = NSMenuItem(title: "Hover the notch, or pick one:", action: nil, keyEquivalent: "")
+        let header = NSMenuItem(title: "Hover the notch, or press ⌃⌥C", action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
-        let boostItem = item("🎯  Focus Boost (\(Prefs.label(Prefs.boostSeconds)))", #selector(boost), key: "c")
-        boostItem.keyEquivalentModifierMask = [.control, .option]
-        menu.addItem(boostItem)
+        menu.addItem(item("🎯  Focus Boost (\(Prefs.label(Prefs.boostSeconds)))", #selector(boost)))
         for (i, c) in categories.enumerated() {
             let mi = item("\(c.emoji)  \(c.name)", #selector(pick(_:)))
             mi.tag = i
@@ -1740,6 +2138,10 @@ final class HotKey {
         let lengthItem = NSMenuItem(title: "Focus Boost Length", action: nil, keyEquivalent: "")
         lengthItem.submenu = lengths
         menu.addItem(lengthItem)
+        let reminders = item("Gentle Break Reminders", #selector(toggleReminders))
+        reminders.state = Prefs.breakReminders ? .on : .off
+        reminders.toolTip = "After about 50 minutes of steady work, the notch peeks out and blinks once. Nothing else."
+        menu.addItem(reminders)
         let login = item("Launch at Login", #selector(toggleLogin))
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(login)
@@ -1759,6 +2161,11 @@ final class HotKey {
     @objc func favorites() { controller.openSpotlight(favoritesCategory) }
     @objc func about() { controller.openResearch() }
     @objc func setBoostLength(_ sender: NSMenuItem) { Prefs.boostSeconds = Double(sender.tag) }
+
+    @objc func toggleReminders() {
+        Prefs.breakReminders.toggle()
+        controller.scheduleReminders()
+    }
 
     @objc func toggleLogin() {
         let s = SMAppService.mainApp
