@@ -28,7 +28,24 @@ let boostCategory = CuteCategory(id: "boost", name: "Focus Boost", emoji: "🎯"
 let favoritesCategory = CuteCategory(id: "favorites", name: "Favorites", emoji: "❤️", subreddits: [])
 
 let userAgent = "macos:com.chrisdimarco.notchcute:v0.2 (open source; github.com/ChrisJDiMarco/NotchCute)"
-let pink = Color(red: 1.0, green: 0.62, blue: 0.72)
+/// One pink, two springs, one radius family: every view draws from here so the app moves and looks like one thing.
+enum Theme {
+    static let pink = Color(red: 1.0, green: 0.62, blue: 0.72)
+    static let pinkDeep = Color(red: 0.98, green: 0.45, blue: 0.55)
+    /// Unfolding and arriving: quick, with a touch of overshoot.
+    static let open = Animation.spring(response: 0.42, dampingFraction: 0.72)
+    /// Tucking away: no bounce.
+    static let settle = Animation.spring(response: 0.32, dampingFraction: 0.9)
+    static let fade = Animation.easeInOut(duration: 0.45)
+    static let cardRadius: CGFloat = 18
+    static let playerRadius: CGFloat = 26
+    /// How long the pointer rests in the notch before the panel opens.
+    static let dwell: TimeInterval = 0.32
+    static var reduceMotion: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+    static func haptic(_ p: NSHapticFeedbackManager.FeedbackPattern = .generic) {
+        NSHapticFeedbackManager.defaultPerformer.perform(p, performanceTime: .now)
+    }
+}
 
 let supportDir: URL = {
     let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("NotchCute", isDirectory: true)
@@ -255,16 +272,23 @@ actor FeedStore {
 // MARK: - Player model
 
 @MainActor final class PlayerModel: ObservableObject {
+    enum LoadState: Equatable { case loading, waiting(until: Date), empty(String) }
+    static let imageSeconds: TimeInterval = 8
+
     let category: CuteCategory
     let boostLength: TimeInterval?
     @Published private(set) var items: [CuteItem] = []
     @Published private(set) var index = 0
-    @Published var status = "Fetching cute things…"
+    @Published private(set) var loadState = LoadState.loading
     @Published private(set) var paused = false
     @Published var muted = true
     @Published private(set) var boostLeft: TimeInterval = 0
     @Published private(set) var boostDone = false
+    @Published private(set) var hearts = 0
+    var videoProgress: Double = 0
     var onBoostDone: (() -> Void)?
+    var onBoostTick: ((TimeInterval) -> Void)?
+    var onTint: ((Color) -> Void)?
 
     private var startedItem: CuteItem?
     private var everStarted = false
@@ -287,7 +311,7 @@ actor FeedStore {
         startBoost()
         if category.id == favoritesCategory.id {
             merge(Favorites.shared.items)
-            if items.isEmpty { status = "No favorites yet. Press F or ♥ on anything you love." }
+            if items.isEmpty { loadState = .empty("No favorites yet. Press F or ♥ on anything you love.") }
             return
         }
         loadTask = Task { [weak self] in
@@ -297,12 +321,12 @@ actor FeedStore {
             guard cached.age > FeedStore.freshFor else { return }
             if self.items.isEmpty {
                 let wait = await FeedStore.shared.secondsUntilAllowed()
-                if wait > 3 { self.status = "Reddit asked for a short break. Trying again in about \(Int(wait.rounded())) s…" }
+                if wait > 3 { self.loadState = .waiting(until: Date().addingTimeInterval(wait)) }
             }
             let fresh = await FeedStore.shared.refresh(self.category)
             if Task.isCancelled { return }
             if let fresh { self.merge(fresh) }
-            if self.items.isEmpty { self.status = "Reddit didn't send anything just now. Close and try again in a minute." }
+            if self.items.isEmpty { self.loadState = .empty("Reddit didn't send anything just now. Try again in a minute.") }
         }
     }
 
@@ -345,6 +369,7 @@ actor FeedStore {
         deadline = nil
         remaining = nil
         startedItem = nil
+        videoProgress = 0
         guard let item = current else { return }
         watchdogTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(15))
@@ -364,7 +389,7 @@ actor FeedStore {
         watchdogTask?.cancel()
         Seen.mark(item.url)
         // Videos advance when they end; the long cap only covers a stream that never reports it.
-        startAdvance(after: item.isVideo ? 300 : 8)
+        startAdvance(after: item.isVideo ? 300 : Self.imageSeconds)
     }
 
     func ended(_ item: CuteItem) { if current == item { next() } }
@@ -373,9 +398,28 @@ actor FeedStore {
         guard let i = items.firstIndex(of: item) else { return }
         let wasCurrent = i == index
         items.remove(at: i)
-        if items.isEmpty { index = 0; status = "Couldn't load anything from this category right now."; didChangeCurrent(); return }
+        if items.isEmpty { index = 0; loadState = .empty("Couldn't load anything from this category right now."); didChangeCurrent(); return }
         if i < index { index -= 1 }
         else if wasCurrent { if index >= items.count { index = 0 }; didChangeCurrent() }
+    }
+
+    func tint(_ c: Color, for item: CuteItem) { if current == item { onTint?(c) } }
+
+    func videoProgressed(_ f: Double, for item: CuteItem) { if current == item { videoProgress = f } }
+
+    /// How far through the current post we are, for the story bar.
+    func progress(at now: Date) -> Double {
+        guard let item = current, startedItem == item else { return 0 }
+        if item.isVideo { return videoProgress }
+        if let d = deadline { return 1 - max(0, d.timeIntervalSince(now)) / Self.imageSeconds }
+        if let r = remaining { return 1 - r / Self.imageSeconds }
+        return 0
+    }
+
+    func toggleFavorite() {
+        guard let item = current else { return }
+        Favorites.shared.toggle(item)
+        if Favorites.shared.contains(item) { hearts += 1; Theme.haptic() }
     }
 
     private func startAdvance(after secs: TimeInterval) {
@@ -404,12 +448,14 @@ actor FeedStore {
 
     private func startBoost() {
         guard boostLength != nil else { return }
+        onBoostTick?(boostLeft)
         boostTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
                 guard let self, !Task.isCancelled else { return }
                 if self.paused || !self.everStarted { continue }
                 self.boostLeft = max(0, self.boostLeft - 0.1)
+                self.onBoostTick?(self.boostLeft)
                 if self.boostLeft == 0 { self.finishBoost(); return }
             }
         }
@@ -418,9 +464,10 @@ actor FeedStore {
     private func finishBoost() {
         advanceTask?.cancel()
         watchdogTask?.cancel()
-        withAnimation(.easeOut(duration: 0.3)) { boostDone = true }
+        Theme.haptic(.levelChange)
+        withAnimation(.easeOut(duration: 0.35)) { boostDone = true }
         Task { [weak self] in
-            try? await Task.sleep(for: .seconds(2.4))
+            try? await Task.sleep(for: .seconds(1.8))
             self?.onBoostDone?()
         }
     }
@@ -428,29 +475,46 @@ actor FeedStore {
     func stop() { advanceTask?.cancel(); watchdogTask?.cancel(); loadTask?.cancel(); boostTask?.cancel() }
 }
 
-// MARK: - Media views
+// MARK: - Media
 
-struct ImageMedia: NSViewRepresentable {
-    let url: URL
-    let onReady: () -> Void
-    let onFail: () -> Void
+extension NSImage {
+    /// The picture's average color, lifted a little so it reads as a glow rather than mud.
+    var glowColor: Color? {
+        guard let cg = cgImage(forProposedRect: nil, context: nil, hints: nil) else { return nil }
+        let n = 8
+        var px = [UInt8](repeating: 0, count: n * n * 4)
+        let drawn: Bool = px.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: n, height: n, bitsPerComponent: 8, bytesPerRow: n * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.interpolationQuality = .medium
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: n, height: n))
+            return true
+        }
+        guard drawn else { return nil }
+        var r = 0.0, g = 0.0, b = 0.0
+        for i in stride(from: 0, to: px.count, by: 4) { r += Double(px[i]); g += Double(px[i + 1]); b += Double(px[i + 2]) }
+        let total = Double(n * n) * 255
+        var h: CGFloat = 0, s: CGFloat = 0, v: CGFloat = 0, a: CGFloat = 0
+        NSColor(srgbRed: r / total, green: g / total, blue: b / total, alpha: 1).getHue(&h, saturation: &s, brightness: &v, alpha: &a)
+        return Color(hue: h, saturation: min(1, s * 1.35 + 0.08), brightness: min(0.95, max(0.5, v * 1.25)))
+    }
+}
+
+/// NSImageView, only for GIFs, so they animate.
+struct AnimatedImage: NSViewRepresentable {
+    let image: NSImage
     func makeNSView(context: Context) -> NSImageView {
         let v = NSImageView()
         v.imageScaling = .scaleProportionallyUpOrDown
         v.animates = true
+        v.image = image
         v.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         v.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
         v.setContentHuggingPriority(.defaultLow, for: .horizontal)
         v.setContentHuggingPriority(.defaultLow, for: .vertical)
-        let url = self.url
-        let onReady = self.onReady
-        let onFail = self.onFail
-        Task { @MainActor in
-            if let img = await ImageCache.shared.image(url) { v.image = img; onReady() } else { onFail() }
-        }
         return v
     }
-    func updateNSView(_ nsView: NSImageView, context: Context) {}
+    func updateNSView(_ v: NSImageView, context: Context) { if v.image !== image { v.image = image } }
 }
 
 final class PlayerNSView: NSView {
@@ -458,20 +522,23 @@ final class PlayerNSView: NSView {
     private let playerLayer = AVPlayerLayer()
     private var endObserver: NSObjectProtocol?
     private var statusObs: NSKeyValueObservation?
+    private var timeObserver: Any?
     private var startedAt: Date?
     private var paused: Bool
     private let onReady: () -> Void
     private let onEnd: () -> Void
     private let onFail: () -> Void
+    private let onProgress: (Double) -> Void
 
-    init(url: URL, paused: Bool, muted: Bool, onReady: @escaping () -> Void, onEnd: @escaping () -> Void, onFail: @escaping () -> Void) {
+    init(url: URL, paused: Bool, muted: Bool, onReady: @escaping () -> Void, onEnd: @escaping () -> Void,
+         onFail: @escaping () -> Void, onProgress: @escaping (Double) -> Void) {
         self.paused = paused
         self.onReady = onReady
         self.onEnd = onEnd
         self.onFail = onFail
+        self.onProgress = onProgress
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = NSColor.black.cgColor
         playerLayer.player = player
         playerLayer.videoGravity = .resizeAspect
         layer?.addSublayer(playerLayer)
@@ -489,6 +556,12 @@ final class PlayerNSView: NSView {
                 else if s == .readyToPlay, let self, self.startedAt == nil { self.startedAt = Date(); self.onReady() }
             }
         }
+        timeObserver = player.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.1, preferredTimescale: 600), queue: .main) { [weak self] t in
+            MainActor.assumeIsolated {
+                guard let self, let d = self.player.currentItem?.duration.seconds, d.isFinite, d > 0 else { return }
+                self.onProgress(min(1, t.seconds / d))
+            }
+        }
         if !paused { player.play() }
     }
 
@@ -496,7 +569,7 @@ final class PlayerNSView: NSView {
 
     /// Short clips loop until they've had 8 s on screen, so a 3 s GIF doesn't flash by.
     private func reachedEnd() {
-        if let s = startedAt, Date().timeIntervalSince(s) < 8 {
+        if let s = startedAt, Date().timeIntervalSince(s) < PlayerModel.imageSeconds {
             player.seek(to: .zero)
             if !paused { player.play() }
             return
@@ -521,6 +594,7 @@ final class PlayerNSView: NSView {
 
     func teardown() {
         player.pause()
+        if let t = timeObserver { player.removeTimeObserver(t) }
         player.replaceCurrentItem(with: nil)
         if let o = endObserver { NotificationCenter.default.removeObserver(o) }
         statusObs = nil
@@ -534,233 +608,505 @@ struct VideoMedia: NSViewRepresentable {
     let onReady: () -> Void
     let onEnd: () -> Void
     let onFail: () -> Void
+    let onProgress: (Double) -> Void
     func makeNSView(context: Context) -> PlayerNSView {
-        PlayerNSView(url: url, paused: paused, muted: muted, onReady: onReady, onEnd: onEnd, onFail: onFail)
+        PlayerNSView(url: url, paused: paused, muted: muted, onReady: onReady, onEnd: onEnd, onFail: onFail, onProgress: onProgress)
     }
     func updateNSView(_ nsView: PlayerNSView, context: Context) { nsView.apply(paused: paused, muted: muted) }
     static func dismantleNSView(_ nsView: PlayerNSView, coordinator: ()) { nsView.teardown() }
 }
 
-// MARK: - Spotlight (dimmed screen + centered player)
+/// One post, full bleed: the media over a blurred copy of itself, so nothing letterboxes onto black.
+/// Stills drift in slowly over their eight seconds.
+struct MediaView: View {
+    let item: CuteItem
+    @ObservedObject var model: PlayerModel
+    @State private var image: NSImage?
+    @State private var backdrop: NSImage?
+    @State private var zoomed = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        ZStack {
+            // In an overlay so the fill-scaled image can't make the layout wider than the card.
+            Color.clear.overlay {
+                if let b = backdrop ?? image {
+                    Image(nsImage: b).resizable().scaledToFill()
+                        .blur(radius: 40, opaque: true)
+                        .overlay(Color.black.opacity(0.35))
+                        .transition(.opacity)
+                }
+            }
+            .clipped()
+            if item.isVideo {
+                VideoMedia(url: item.url, paused: model.paused || model.boostDone, muted: model.muted,
+                           onReady: { model.ready(item) }, onEnd: { model.ended(item) }, onFail: { model.failed(item) },
+                           onProgress: { model.videoProgressed($0, for: item) })
+            } else if let image {
+                Group {
+                    if item.url.pathExtension.lowercased() == "gif" { AnimatedImage(image: image) }
+                    else { Image(nsImage: image).resizable().interpolation(.high).scaledToFit() }
+                }
+                .scaleEffect(zoomed ? 1.06 : 1)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .task { await load() }
+    }
+
+    private func load() async {
+        if item.isVideo {
+            guard let t = item.thumb, let img = await ImageCache.shared.image(t) else { return }
+            withAnimation(.easeOut(duration: 0.3)) { backdrop = img }
+            await applyTint(img)
+            return
+        }
+        guard let img = await ImageCache.shared.image(item.url) else { model.failed(item); return }
+        image = img
+        model.ready(item)
+        if !reduceMotion { withAnimation(.linear(duration: PlayerModel.imageSeconds + 1)) { zoomed = true } }
+        await applyTint(img)
+    }
+
+    private func applyTint(_ img: NSImage) async {
+        if let c = await Task.detached(priority: .utility, operation: { img.glowColor }).value { model.tint(c, for: item) }
+    }
+}
+
+// MARK: - Spotlight
+
+/// Wraps an overlay card: dims and tints the screen, and flies the card out of `origin` (a notch card,
+/// or the notch itself) to the center, then back into the notch on close.
+@MainActor final class OverlayState: ObservableObject {
+    @Published var presented = false
+    @Published var origin: CGRect
+    @Published private(set) var tint: Color?
+    @Published private(set) var tintKey = 0
+    init(origin: CGRect) { self.origin = origin }
+    func setTint(_ c: Color) { tint = c; tintKey += 1 }
+}
+
+struct Presented<Content: View>: View {
+    @ObservedObject var overlay: OverlayState
+    let cardSize: CGSize
+    let close: () -> Void
+    let content: Content
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    var body: some View {
+        GeometryReader { g in
+            let p = overlay.presented
+            let o = overlay.origin
+            let s = reduceMotion ? 1 : max(0.04, o.width / cardSize.width)
+            let dx = reduceMotion ? 0 : o.midX - g.size.width / 2
+            let dy = reduceMotion ? 0 : o.midY - g.size.height / 2
+            ZStack {
+                backdrop(g.size)
+                    .opacity(p ? 1 : 0)
+                    .contentShape(Rectangle())
+                    .onTapGesture(perform: close)
+                content
+                    .opacity(p ? 1 : 0)
+                    .frame(width: cardSize.width, height: cardSize.height)
+                    .background(Color(white: 0.07))
+                    .clipShape(RoundedRectangle(cornerRadius: p ? Theme.playerRadius : min(Theme.cardRadius / s, cardSize.height / 2), style: .continuous))
+                    .shadow(color: .black.opacity(p ? 0.5 : 0), radius: 40, y: 14)
+                    .contentShape(Rectangle())
+                    .onTapGesture {}
+                    .scaleEffect(p ? 1 : s)
+                    .offset(x: p ? 0 : dx, y: p ? 0 : dy)
+            }
+            .frame(width: g.size.width, height: g.size.height)
+        }
+        .ignoresSafeArea()
+        .environment(\.colorScheme, .dark)
+    }
+
+    private func backdrop(_ size: CGSize) -> some View {
+        ZStack {
+            Color.black.opacity(reduceTransparency ? 0.94 : 0.8)
+            if let t = overlay.tint {
+                RadialGradient(colors: [t.opacity(0.6), t.opacity(0.28), .clear], center: .center,
+                               startRadius: min(size.width, size.height) * 0.25, endRadius: max(size.width, size.height) * 0.7)
+                    .id(overlay.tintKey)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 1.1), value: overlay.tintKey)
+    }
+}
+
+/// Mouse movement over the card, kept outside SwiftUI state so it doesn't redraw on every move.
+final class Activity { var last = Date() }
 
 struct SpotlightView: View {
     @ObservedObject var model: PlayerModel
     @ObservedObject var favorites = Favorites.shared
-    let cardSize: CGSize
     let close: () -> Void
     let open: (URL) -> Void
+    @State private var chrome = true
+    @State private var activity = Activity()
+    @State private var overControls = false
+
+    /// Title, credit and controls step back after a couple of quiet seconds and return on any mouse move.
+    private var chromeShown: Bool { chrome || overControls || model.paused || model.current == nil || model.boostDone }
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.82)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture { close() }
-
-            VStack(spacing: 0) {
-                header
-                media
-                footer
+            ZStack {
+                if let item = model.current {
+                    MediaView(item: item, model: model).id(item.url).transition(.opacity)
+                } else {
+                    placeholder.transition(.opacity)
+                }
             }
-            .foregroundColor(.white)
-            .frame(width: cardSize.width, height: cardSize.height)
-            .background(Color(white: 0.09))
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .shadow(color: .black.opacity(0.6), radius: 40)
-            .contentShape(Rectangle())
-            .onTapGesture {}
+            .animation(Theme.fade, value: model.current?.url)
+            scrims
+            chromeLayer
+            if model.boostDone { doneOverlay.transition(.opacity) }
+        }
+        .foregroundColor(.white)
+        .onContinuousHover { phase in if case .active = phase { poke() } }
+        .task {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(400))
+                if chrome && Date().timeIntervalSince(activity.last) > 2.2 { withAnimation(.easeOut(duration: 0.5)) { chrome = false } }
+            }
         }
     }
 
-    private var header: some View {
-        VStack(spacing: 10) {
+    private func poke() {
+        activity.last = Date()
+        if !chrome { withAnimation(.easeOut(duration: 0.2)) { chrome = true } }
+    }
+
+    private var scrims: some View {
+        VStack(spacing: 0) {
+            LinearGradient(colors: [.black.opacity(0.5), .clear], startPoint: .top, endPoint: .bottom)
+                .frame(height: 120)
+                .opacity(chromeShown || model.boostLength != nil ? 1 : 0)
+            Spacer(minLength: 0)
+            LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .top, endPoint: .bottom)
+                .frame(height: 190)
+                .opacity(chromeShown ? 1 : 0)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private var chromeLayer: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 12) {
+                progressRow.opacity(chromeShown || model.boostLength != nil ? 1 : 0)
+                HStack(spacing: 8) {
+                    Text("\(model.category.emoji)  \(model.category.name)").font(.system(size: 13, weight: .semibold, design: .rounded))
+                    if let s = model.current?.subreddit, !s.isEmpty {
+                        Text("r/\(s)").font(.system(size: 13, design: .rounded)).opacity(0.6)
+                    }
+                    Spacer()
+                    CloseButton(action: close)
+                }
+                .opacity(chromeShown ? 1 : 0)
+                .allowsHitTesting(chromeShown)
+            }
+            Spacer(minLength: 0)
+            bottomRow
+                .opacity(chromeShown ? 1 : 0)
+                .allowsHitTesting(chromeShown)
+        }
+        .padding(18)
+    }
+
+    @ViewBuilder private var progressRow: some View {
+        if let len = model.boostLength {
             HStack(spacing: 10) {
-                Text("\(model.category.emoji)  \(model.category.name)")
-                    .font(.system(size: 17, weight: .bold, design: .rounded))
-                Spacer()
-                if model.boostLength != nil {
-                    Text(clock(model.boostLeft)).font(.system(size: 14, weight: .semibold, design: .rounded)).monospacedDigit().opacity(0.7)
-                } else if let item = model.current, !item.subreddit.isEmpty {
-                    Text("r/\(item.subreddit)").font(.system(size: 13, design: .rounded)).opacity(0.6)
-                }
-                Button(action: close) { Image(systemName: "xmark.circle.fill").font(.system(size: 20)) }
-                    .buttonStyle(.plain)
-                    .help("Close (Esc)")
-            }
-            if let len = model.boostLength {
-                Capsule().fill(Color.white.opacity(0.12)).frame(height: 4)
+                Capsule().fill(Color.white.opacity(0.2)).frame(height: 4)
                     .overlay(alignment: .leading) {
-                        Capsule().fill(pink).frame(width: (cardSize.width - 32) * (1 - model.boostLeft / len))
-                            .animation(.linear(duration: 0.1), value: model.boostLeft)
+                        GeometryReader { g in Capsule().fill(Theme.pink).frame(width: g.size.width * (1 - model.boostLeft / len)) }
                     }
+                    .animation(.linear(duration: 0.1), value: model.boostLeft)
+                Text(clock(model.boostLeft)).font(.system(size: 12, weight: .semibold, design: .rounded)).monospacedDigit().opacity(0.85)
             }
+        } else {
+            StorySegments(model: model, paused: !chromeShown)
         }
-        .padding(16)
     }
 
-    private var media: some View {
-        ZStack {
-            Color.black
+    private var bottomRow: some View {
+        HStack(alignment: .bottom, spacing: 16) {
             if let item = model.current {
-                Group {
-                    if item.isVideo {
-                        VideoMedia(url: item.url, paused: model.paused || model.boostDone, muted: model.muted,
-                                   onReady: { model.ready(item) }, onEnd: { model.ended(item) }, onFail: { model.failed(item) })
-                    } else {
-                        ImageMedia(url: item.url, onReady: { model.ready(item) }, onFail: { model.failed(item) })
-                    }
-                }
-                .id(item.url)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                VStack(spacing: 12) {
-                    ProgressView().controlSize(.large).tint(.white)
-                    Text(model.status).font(.system(size: 14, design: .rounded)).opacity(0.8).multilineTextAlignment(.center)
-                }
-                .padding(.horizontal, 40)
-            }
-            if model.paused {
-                Label("Paused", systemImage: "pause.fill")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .padding(.horizontal, 10).padding(.vertical, 5)
-                    .background(Capsule().fill(Color.black.opacity(0.6)))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(12)
-            }
-            if model.boostDone {
-                VStack(spacing: 8) {
-                    Text("✨").font(.system(size: 52))
-                    Text("That's your boost.").font(.system(size: 24, weight: .bold, design: .rounded))
-                    Text("Now go do the careful stuff.").font(.system(size: 15, design: .rounded)).opacity(0.75)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black.opacity(0.78))
-                .transition(.opacity)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var footer: some View {
-        HStack(spacing: 10) {
-            if let item = model.current {
-                VStack(alignment: .leading, spacing: 3) {
+                VStack(alignment: .leading, spacing: 5) {
                     Text(item.title)
-                        .font(.system(size: 14, weight: .medium, design: .rounded))
+                        .font(.system(size: 16, weight: .semibold, design: .rounded))
                         .lineLimit(2)
+                        .shadow(color: .black.opacity(0.35), radius: 8)
                     if item.permalink != nil {
-                        HStack(spacing: 4) {
-                            if let a = item.author { Text("u/\(a)  ·").opacity(0.55) }
-                            Text("Open on Reddit ›").foregroundColor(pink)
+                        HStack(spacing: 6) {
+                            if let a = item.author {
+                                Text("u/\(a)").opacity(0.65)
+                                Text("·").opacity(0.4)
+                            }
+                            Text("Open on Reddit ›").foregroundColor(Theme.pink)
                         }
-                        .font(.system(size: 12, design: .rounded))
+                        .font(.system(size: 12, weight: .medium, design: .rounded))
                     }
                 }
                 .contentShape(Rectangle())
                 .onTapGesture { if let p = item.permalink { open(p) } }
                 .help(item.permalink == nil ? "" : "Open this post on Reddit (O)")
-                Spacer(minLength: 12)
-                let fav = favorites.contains(item)
-                circleButton(fav ? "heart.fill" : "heart", tint: fav ? pink : .white, help: "Favorite (F)") { favorites.toggle(item) }
-                if item.isVideo {
-                    circleButton(model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: "Sound (M)") { model.muted.toggle() }
-                }
-            } else {
-                Spacer()
             }
-            circleButton(model.paused ? "play.fill" : "pause.fill", help: model.paused ? "Resume (Space)" : "Pause (Space)") { model.togglePause() }
-            circleButton("chevron.left", help: "Previous (←)") { model.prev() }
-            circleButton("chevron.right", help: "Next (→)") { model.next() }
+            Spacer(minLength: 12)
+            controls
         }
-        .padding(16)
     }
 
-    private func circleButton(_ symbol: String, tint: Color = .white, help: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: symbol)
-                .font(.system(size: 14, weight: .bold))
-                .foregroundColor(tint)
-                .frame(width: 34, height: 34)
-                .background(Circle().fill(Color.white.opacity(0.12)))
+    private var controls: some View {
+        HStack(spacing: 2) {
+            if let item = model.current {
+                let fav = favorites.contains(item)
+                PillButton(symbol: fav ? "heart.fill" : "heart", tint: fav ? Theme.pink : .white, help: "Favorite (F)", bounce: model.hearts) {
+                    model.toggleFavorite()
+                }
+                .overlay { if model.hearts > 0 { HeartBurst().id(model.hearts) } }
+                if item.isVideo {
+                    PillButton(symbol: model.muted ? "speaker.slash.fill" : "speaker.wave.2.fill", help: "Sound (M)") { model.muted.toggle() }
+                }
+            }
+            PillButton(symbol: model.paused ? "play.fill" : "pause.fill", help: model.paused ? "Resume (Space)" : "Pause (Space)") { model.togglePause() }
+            PillButton(symbol: "chevron.left", help: "Previous (←)") { model.prev() }
+            PillButton(symbol: "chevron.right", help: "Next (→)") { model.next() }
         }
-        .buttonStyle(.plain)
-        .help(help)
+        .padding(4)
+        .modifier(GlassCapsule())
+        .onHover { overControls = $0 }
     }
 
-    private func clock(_ t: TimeInterval) -> String {
-        let s = Int(t.rounded(.up))
-        return String(format: "%d:%02d", s / 60, s % 60)
+    @ViewBuilder private var placeholder: some View {
+        VStack(spacing: 14) {
+            switch model.loadState {
+            case .loading:
+                PawPulse()
+                Text("Fetching cute things…")
+            case .waiting(let until):
+                SleepyCat()
+                TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                    Text("Reddit asked for a short break. Back in \(max(1, Int(until.timeIntervalSince(ctx.date).rounded(.up)))) s")
+                }
+            case .empty(let message):
+                Text("🙀").font(.system(size: 44))
+                Text(message)
+            }
+        }
+        .font(.system(size: 14, design: .rounded))
+        .foregroundColor(.white.opacity(0.8))
+        .multilineTextAlignment(.center)
+        .padding(.horizontal, 40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var doneOverlay: some View {
+        VStack(spacing: 8) {
+            Text("✨").font(.system(size: 52))
+            Text("That's your boost.").font(.system(size: 24, weight: .bold, design: .rounded))
+            Text("Now go do the careful stuff.").font(.system(size: 15, design: .rounded)).opacity(0.75)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.62))
     }
 }
 
-// MARK: - Research modal
+/// A short window of story-style segments around the current post; the current one fills as it plays.
+struct StorySegments: View {
+    @ObservedObject var model: PlayerModel
+    let paused: Bool
 
-struct ResearchView: View {
-    let cardSize: CGSize
-    let close: () -> Void
+    var body: some View {
+        let n = model.items.count
+        let i = model.index
+        let span = min(n, 7)
+        let start = n <= 7 ? 0 : min(max(0, i - 2), n - span)
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: paused)) { ctx in
+            HStack(spacing: 4) {
+                ForEach(0..<span, id: \.self) { k in
+                    let idx = start + k
+                    let f: Double = idx < i ? 1 : idx > i ? 0 : model.progress(at: ctx.date)
+                    Capsule().fill(Color.white.opacity(0.28))
+                        .overlay(alignment: .leading) {
+                            GeometryReader { g in Capsule().fill(Color.white).frame(width: g.size.width * f) }
+                        }
+                }
+            }
+        }
+        .frame(height: 3)
+    }
+}
+
+struct PillButton: View {
+    let symbol: String
+    var tint: Color = .white
+    let help: String
+    var bounce = 0
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundColor(tint)
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.bounce, value: bounce)
+                .frame(width: 32, height: 32)
+                .background(Circle().fill(Color.white.opacity(hover ? 0.16 : 0)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help(help)
+    }
+}
+
+struct CloseButton: View {
+    let action: () -> Void
+    @State private var hover = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "xmark")
+                .font(.system(size: 11, weight: .bold))
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(Color.white.opacity(hover ? 0.24 : 0.14)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hover = $0 }
+        .help("Close (Esc)")
+    }
+}
+
+struct GlassCapsule: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    func body(content: Content) -> some View {
+        content.background {
+            if reduceTransparency { Capsule().fill(Color.black.opacity(0.85)) } else { Capsule().fill(.ultraThinMaterial) }
+        }
+    }
+}
+
+struct HeartBurst: View {
+    @State private var fly = false
 
     var body: some View {
         ZStack {
-            Color.black.opacity(0.82)
-                .ignoresSafeArea()
-                .contentShape(Rectangle())
-                .onTapGesture { close() }
+            ForEach(0..<7, id: \.self) { i in
+                let a = Double(i) / 7 * 2 * .pi - .pi / 2
+                Image(systemName: "heart.fill")
+                    .font(.system(size: 8 + CGFloat(i % 3) * 2))
+                    .foregroundColor(Theme.pink)
+                    .offset(x: fly ? cos(a) * 30 : 0, y: fly ? sin(a) * 30 : 0)
+                    .scaleEffect(fly ? 0.5 : 1)
+                    .opacity(fly ? 0 : 1)
+            }
+        }
+        .allowsHitTesting(false)
+        .onAppear { withAnimation(.easeOut(duration: 0.65)) { fly = true } }
+    }
+}
 
-            VStack(spacing: 0) {
-                HStack {
-                    Text("Why NotchCute exists").font(.system(size: 21, weight: .bold, design: .rounded))
-                    Spacer()
-                    Button(action: close) { Image(systemName: "xmark.circle.fill").font(.system(size: 20)) }
-                        .buttonStyle(.plain)
-                }
-                .padding(20)
+struct PawPulse: View {
+    @State private var up = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
-                        Text("I came across a study from Hiroshima University showing that a short look at baby animals makes people more careful and more focused afterward. That seemed worth having one hover away, so I built this. Here is what the research found.")
-                            .font(.system(size: 14, design: .rounded)).opacity(0.85)
+    var body: some View {
+        Text("🐾").font(.system(size: 40))
+            .scaleEffect(up ? 1.1 : 0.92)
+            .opacity(up ? 1 : 0.6)
+            .onAppear {
+                guard !reduceMotion else { up = true; return }
+                withAnimation(.easeInOut(duration: 0.8).repeatForever(autoreverses: true)) { up = true }
+            }
+    }
+}
 
-                        heading("The Power of Kawaii", "Nittono, Fukushima, Yano & Moriya · Hiroshima University · PLoS ONE, 2012")
-                        item("🩺  Steadier hands", "In an Operation-style tweezers game, people who first looked at puppy and kitten photos improved their scores by 43.9%. People shown adult dogs and cats improved by 11.9%. The baby-animal group slowed down and worked more carefully.")
-                        item("🔍  Sharper eyes", "In a timed number-search task, the baby-animal group improved 15.7%. Adult animals: 1.4%. Photos of tasty food: 1.2%. So it isn't just feeling good. Cuteness itself did the work.")
-                        item("🎯  Tighter focus", "Cute images made people less likely to see the big picture first and more likely to zero in on the details.")
-                        item("🧠  Why it works", "Baby features like big eyes, round faces and large heads switch on a caretaking instinct. Instead of relaxing you, that instinct makes you careful.")
+struct SleepyCat: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-                        heading("Related research", "")
-                        item("🐈  Cat videos and mood", "Myrick, 2015 · Computers in Human Behavior. A survey of nearly 7,000 people found that watching cat videos online left them feeling more energetic and positive, and less anxious, annoyed and sad. These were people's own reports of how they felt.")
-                        item("🏀  Free throws under pressure", "Yoshikawa & Masaki, 2021 · Frontiers in Psychology. A smaller follow-up tested whether looking at cute pictures helps people keep their free-throw accuracy when the pressure is on.")
-
-                        heading("When to use it", "")
-                        Text("A quick look helps most before detail work: proofreading, checking numbers, careful editing. It helps less before brainstorming, because a narrower focus is the whole effect. That's what Focus Boost is for: a short run of baby animals that ends on its own and sends you back to work.")
-                            .font(.system(size: 14, design: .rounded)).opacity(0.85)
-
-                        heading("Read the papers", "")
-                        VStack(alignment: .leading, spacing: 8) {
-                            Link("Nittono et al. (2012), PLoS ONE ›", destination: URL(string: "https://doi.org/10.1371/journal.pone.0046362")!)
-                            Link("Myrick (2015), Computers in Human Behavior ›", destination: URL(string: "https://doi.org/10.1016/j.chb.2015.06.001")!)
-                            Link("Yoshikawa & Masaki (2021), Frontiers in Psychology ›", destination: URL(string: "https://doi.org/10.3389/fpsyg.2021.610817")!)
-                        }
-                        .font(.system(size: 13, weight: .semibold, design: .rounded))
-                        .tint(pink)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 26)
-                    .padding(.bottom, 26)
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: reduceMotion)) { ctx in
+            let t = ctx.date.timeIntervalSinceReferenceDate / 2.4
+            ZStack(alignment: .topTrailing) {
+                Text("🐱").font(.system(size: 52))
+                ForEach(0..<3, id: \.self) { i in
+                    let f = (t + Double(i) / 3).truncatingRemainder(dividingBy: 1)
+                    Text("z")
+                        .font(.system(size: 11 + CGFloat(i) * 3, weight: .bold, design: .rounded))
+                        .foregroundColor(.white.opacity(0.8 * (1 - f)))
+                        .offset(x: 6 + f * 18, y: -f * 34)
                 }
             }
-            .foregroundColor(.white)
-            .frame(width: cardSize.width, height: cardSize.height)
-            .background(Color(white: 0.09))
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .shadow(color: .black.opacity(0.6), radius: 40)
-            .contentShape(Rectangle())
-            .onTapGesture {}
         }
+    }
+}
+
+func clock(_ t: TimeInterval) -> String {
+    let s = Int(t.rounded(.up))
+    return String(format: "%d:%02d", s / 60, s % 60)
+}
+
+// MARK: - Research card
+
+struct ResearchView: View {
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Why NotchCute exists").font(.system(size: 21, weight: .bold, design: .rounded))
+                Spacer()
+                CloseButton(action: close)
+            }
+            .padding(20)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("I came across a study from Hiroshima University showing that a short look at baby animals makes people more careful and more focused afterward. That seemed worth having one hover away, so I built this. Here is what the research found.")
+                        .font(.system(size: 14, design: .rounded)).opacity(0.85)
+
+                    heading("The Power of Kawaii", "Nittono, Fukushima, Yano & Moriya · Hiroshima University · PLoS ONE, 2012")
+                    item("🩺  Steadier hands", "In an Operation-style tweezers game, people who first looked at puppy and kitten photos improved their scores by 43.9%. People shown adult dogs and cats improved by 11.9%. The baby-animal group slowed down and worked more carefully.")
+                    item("🔍  Sharper eyes", "In a timed number-search task, the baby-animal group improved 15.7%. Adult animals: 1.4%. Photos of tasty food: 1.2%. So it isn't just feeling good. Cuteness itself did the work.")
+                    item("🎯  Tighter focus", "Cute images made people less likely to see the big picture first and more likely to zero in on the details.")
+                    item("🧠  Why it works", "Baby features like big eyes, round faces and large heads switch on a caretaking instinct. Instead of relaxing you, that instinct makes you careful.")
+
+                    heading("Related research", "")
+                    item("🐈  Cat videos and mood", "Myrick, 2015 · Computers in Human Behavior. A survey of nearly 7,000 people found that watching cat videos online left them feeling more energetic and positive, and less anxious, annoyed and sad. These were people's own reports of how they felt.")
+                    item("🏀  Free throws under pressure", "Yoshikawa & Masaki, 2021 · Frontiers in Psychology. A smaller follow-up tested whether looking at cute pictures helps people keep their free-throw accuracy when the pressure is on.")
+
+                    heading("When to use it", "")
+                    Text("A quick look helps most before detail work: proofreading, checking numbers, careful editing. It helps less before brainstorming, because a narrower focus is the whole effect. That's what Focus Boost is for: a short run of baby animals that ends on its own and sends you back to work.")
+                        .font(.system(size: 14, design: .rounded)).opacity(0.85)
+
+                    heading("Read the papers", "")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Link("Nittono et al. (2012), PLoS ONE ›", destination: URL(string: "https://doi.org/10.1371/journal.pone.0046362")!)
+                        Link("Myrick (2015), Computers in Human Behavior ›", destination: URL(string: "https://doi.org/10.1016/j.chb.2015.06.001")!)
+                        Link("Yoshikawa & Masaki (2021), Frontiers in Psychology ›", destination: URL(string: "https://doi.org/10.3389/fpsyg.2021.610817")!)
+                    }
+                    .font(.system(size: 13, weight: .semibold, design: .rounded))
+                    .tint(Theme.pink)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 26)
+                .padding(.bottom, 26)
+            }
+        }
+        .foregroundColor(.white)
     }
 
     private func heading(_ title: String, _ sub: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
-            Text(title).font(.system(size: 16, weight: .bold, design: .rounded)).foregroundColor(pink)
+            Text(title).font(.system(size: 16, weight: .bold, design: .rounded)).foregroundColor(Theme.pink)
             if !sub.isEmpty { Text(sub).font(.system(size: 12, design: .rounded)).opacity(0.55) }
         }
         .padding(.top, 4)
@@ -776,9 +1122,16 @@ struct ResearchView: View {
 
 // MARK: - Notch gallery
 
+/// hidden: tucked behind the notch. peek: you're hovering and it's about to open. open: the gallery.
+/// glow: a pink pulse when a Focus Boost lands back in the notch.
+enum NotchPhase { case hidden, peek, open, glow }
+
 @MainActor final class NotchState: ObservableObject {
-    @Published var expanded = false
+    @Published var phase = NotchPhase.hidden
     @Published var thumbs: [String: NSImage] = [:]
+    @Published var notchSize = CGSize(width: 180, height: 0)
+    @Published var panelSize = CGSize(width: 700, height: 200)
+    @Published var notchHeight: CGFloat = 32
 }
 
 let cardWidth: CGFloat = 96
@@ -787,22 +1140,54 @@ let cardSpacing: CGFloat = 10
 struct NotchGalleryView: View {
     @ObservedObject var state: NotchState
     @ObservedObject var favorites = Favorites.shared
-    let notchHeight: CGFloat
-    let onPick: (CuteCategory) -> Void
-    let onBoost: () -> Void
+    let onPick: (CuteCategory, CGRect?) -> Void
     let onAbout: () -> Void
     @State private var hovered: String?
     @State private var aboutHovered = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private var open: Bool { state.phase == .open }
+
+    /// One black shape that is the notch, grows a little while you hover, and unfolds into the gallery.
     var body: some View {
+        let size = shapeSize
+        let r: CGFloat = open ? 28 : 10
+        let shape = UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: r, bottomTrailingRadius: r, topTrailingRadius: 0, style: .continuous)
+        ZStack(alignment: .top) {
+            content.frame(width: state.panelSize.width, height: state.panelSize.height, alignment: .top)
+            if state.phase == .peek {
+                PeekFace().frame(width: size.width, height: size.height).transition(.opacity)
+            }
+        }
+        .frame(width: size.width, height: size.height, alignment: .top)
+        .background(Color.black)
+        .clipShape(shape)
+        .background(shape.fill(Color.black).shadow(color: Theme.pink.opacity(state.phase == .glow ? 0.95 : 0), radius: state.phase == .glow ? 18 : 0))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
+
+    private var shapeSize: CGSize {
+        let n = state.notchSize
+        switch state.phase {
+        case .open: return state.panelSize
+        case .peek: return CGSize(width: n.width + 28, height: n.height + 18)
+        case .glow: return CGSize(width: n.width + 10, height: max(n.height, 6) + 4)
+        case .hidden: return n
+        }
+    }
+
+    private var content: some View {
         VStack(spacing: 0) {
-            Spacer().frame(height: notchHeight)
+            Spacer().frame(height: state.notchHeight)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: cardSpacing) {
-                    card(boostCategory, sub: Prefs.label(Prefs.boostSeconds), accent: true) { onBoost() }
-                    ForEach(categories) { c in card(c) { onPick(c) } }
-                    if !favorites.items.isEmpty {
-                        card(favoritesCategory, sub: "\(favorites.items.count)") { onPick(favoritesCategory) }
+                    let cards = [boostCategory] + categories + (favorites.items.isEmpty ? [] : [favoritesCategory])
+                    ForEach(Array(cards.enumerated()), id: \.element.id) { i, c in
+                        card(c)
+                            .opacity(open ? 1 : 0)
+                            .offset(y: open || reduceMotion ? 0 : -14)
+                            .scaleEffect(open || reduceMotion ? 1 : 0.9, anchor: .top)
+                            .animation(open ? (reduceMotion ? .easeOut(duration: 0.15) : Theme.open.delay(0.05 + Double(i) * 0.035)) : .easeIn(duration: 0.1), value: open)
                     }
                 }
                 .padding(.horizontal, 18)
@@ -813,7 +1198,7 @@ struct NotchGalleryView: View {
                     .foregroundColor(.white.opacity(0.72))
                 Text("See why ›")
                     .fontWeight(.semibold)
-                    .foregroundColor(pink)
+                    .foregroundColor(Theme.pink)
                     .underline(aboutHovered)
             }
             .font(.system(size: 12, design: .rounded))
@@ -823,27 +1208,30 @@ struct NotchGalleryView: View {
             .onHover { aboutHovered = $0 }
             .onTapGesture { onAbout() }
             .padding(.bottom, 12)
+            .opacity(open ? 1 : 0)
+            .animation(open ? .easeOut(duration: 0.3).delay(0.25) : .easeIn(duration: 0.1), value: open)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .background(
-            UnevenRoundedRectangle(topLeadingRadius: 0, bottomLeadingRadius: 28, bottomTrailingRadius: 28, topTrailingRadius: 0, style: .continuous)
-                .fill(Color.black)
-        )
-        .scaleEffect(x: state.expanded ? 1 : 0.3, y: state.expanded ? 1 : 0.15, anchor: .top)
-        .opacity(state.expanded ? 1 : 0)
     }
 
-    private func card(_ c: CuteCategory, sub: String? = nil, accent: Bool = false, action: @escaping () -> Void) -> some View {
+    private func sub(for c: CuteCategory) -> String? {
+        if c.id == boostCategory.id { return Prefs.label(Prefs.boostSeconds) }
+        if c.id == favoritesCategory.id { return "\(favorites.items.count)" }
+        return nil
+    }
+
+    private func card(_ c: CuteCategory) -> some View {
         let isHovered = hovered == c.id
-        let shape = RoundedRectangle(cornerRadius: 18, style: .continuous)
+        let accent = c.id == boostCategory.id
+        let shape = RoundedRectangle(cornerRadius: Theme.cardRadius, style: .continuous)
         return ZStack(alignment: .bottomLeading) {
             if accent {
-                LinearGradient(colors: [pink, Color(red: 0.98, green: 0.45, blue: 0.55)], startPoint: .topLeading, endPoint: .bottomTrailing)
+                LinearGradient(colors: [Theme.pink, Theme.pinkDeep], startPoint: .topLeading, endPoint: .bottomTrailing)
             } else {
                 Color.white.opacity(isHovered ? 0.2 : 0.08)
             }
-            if let t = state.thumbs[c.id] {
+            if !accent, let t = state.thumbs[c.id] {
                 Image(nsImage: t).resizable().scaledToFill().frame(width: cardWidth, height: 112).clipped()
+                    .scaleEffect(isHovered ? 1.08 : 1)
                 LinearGradient(colors: [.clear, .black.opacity(0.85)], startPoint: .center, endPoint: .bottom)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(c.emoji).font(.system(size: 18))
@@ -854,7 +1242,7 @@ struct NotchGalleryView: View {
                 VStack(spacing: 5) {
                     Text(c.emoji).font(.system(size: 40))
                     Text(c.name).font(.system(size: 12, weight: .semibold, design: .rounded))
-                    if let sub { Text(sub).font(.system(size: 10, weight: .medium, design: .rounded)).opacity(0.75) }
+                    if let sub = sub(for: c) { Text(sub).font(.system(size: 10, weight: .medium, design: .rounded)).opacity(0.75) }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -863,11 +1251,51 @@ struct NotchGalleryView: View {
         .frame(width: cardWidth, height: 112)
         .clipShape(shape)
         .overlay(shape.strokeBorder(Color.white.opacity(isHovered ? 0.55 : 0), lineWidth: 1.5))
-        .scaleEffect(isHovered ? 1.07 : 1)
+        .overlay(GeometryReader { g in
+            Color.clear.contentShape(Rectangle()).onTapGesture { onPick(c, g.frame(in: .global)) }
+        })
+        .scaleEffect(isHovered ? 1.06 : 1)
         .animation(.spring(response: 0.25, dampingFraction: 0.7), value: hovered)
-        .contentShape(Rectangle())
         .onHover { h in if h { hovered = c.id } else if hovered == c.id { hovered = nil } }
-        .onTapGesture(perform: action)
+    }
+}
+
+/// Two eyes and a filling line under the notch while the pointer rests there: it noticed you, and it's opening.
+struct PeekFace: View {
+    @State private var shown = false
+    @State private var blink = false
+    @State private var fill = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Spacer(minLength: 0)
+            HStack(spacing: 14) { eye; eye }.frame(height: 8)
+            GeometryReader { g in
+                Capsule().fill(Theme.pink).frame(width: fill ? g.size.width : 0, height: 2)
+            }
+            .frame(height: 2)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 4)
+        }
+        .onAppear {
+            withAnimation(.spring(response: 0.22, dampingFraction: 0.6)) { shown = true }
+            withAnimation(.linear(duration: Theme.dwell)) { fill = true }
+            guard !reduceMotion else { return }
+            Task {
+                try? await Task.sleep(for: .seconds(Theme.dwell * 0.5))
+                withAnimation(.easeInOut(duration: 0.06)) { blink = true }
+                try? await Task.sleep(for: .seconds(0.09))
+                withAnimation(.easeInOut(duration: 0.08)) { blink = false }
+            }
+        }
+    }
+
+    private var eye: some View {
+        Capsule().fill(Color.white)
+            .frame(width: 6, height: blink ? 1.5 : 6)
+            .scaleEffect(shown ? 1 : 0.2)
+            .opacity(shown ? 1 : 0)
     }
 }
 
@@ -884,8 +1312,9 @@ final class KeyWindow: NSWindow {
 
 @MainActor final class NotchController {
     private var panel: NSPanel?
-    private var panelShown = false
+    private var openRect = NSRect.zero
     private var spotlight: NSWindow?
+    private var overlay: OverlayState?
     private var model: PlayerModel?
     private var keyMonitor: Any?
     private var mouseMonitors: [Any] = []
@@ -896,6 +1325,10 @@ final class KeyWindow: NSWindow {
     private var cooldownUntil = Date.distantPast
     private var warmTask: Task<Void, Never>?
     private let state = NotchState()
+    /// Remaining Focus Boost time for the menu bar, or nil when none is running.
+    var statusTick: ((TimeInterval?) -> Void)?
+
+    private var panelOpen: Bool { state.phase == .open }
 
     /// Mouse-move events wake the hover check; the 20 Hz timer only runs while a hover or the panel is in progress.
     func start() {
@@ -921,16 +1354,29 @@ final class KeyWindow: NSWindow {
 
     private func notchHeight(_ s: NSScreen) -> CGFloat { s.safeAreaInsets.top > 0 ? s.safeAreaInsets.top : 24 }
 
-    /// The notch itself, padded a few points; a thin strip at top-center on screens without one.
-    private func hotZone(_ s: NSScreen) -> NSRect {
+    /// The notch itself, or a stand-in strip at top-center on screens without one.
+    private func notchRect(_ s: NSScreen) -> NSRect {
         let top = s.frame.maxY
         if s.safeAreaInsets.top > 0, let l = s.auxiliaryTopLeftArea, let r = s.auxiliaryTopRightArea {
             let x0 = s.frame.minX + l.width
             let x1 = s.frame.maxX - r.width
-            let h = s.safeAreaInsets.top
-            return NSRect(x: x0 - 6, y: top - h, width: (x1 - x0) + 12, height: h + 4)
+            return NSRect(x: x0, y: top - s.safeAreaInsets.top, width: x1 - x0, height: s.safeAreaInsets.top)
         }
-        return NSRect(x: s.frame.midX - 110, y: top - 6, width: 220, height: 10)
+        return NSRect(x: s.frame.midX - 90, y: top - 24, width: 180, height: 24)
+    }
+
+    /// The notch, padded a few points; a thin strip at top-center on screens without one.
+    private func hotZone(_ s: NSScreen) -> NSRect {
+        if s.safeAreaInsets.top > 0 {
+            let n = notchRect(s)
+            return NSRect(x: n.minX - 6, y: n.minY, width: n.width + 12, height: n.height + 4)
+        }
+        return NSRect(x: s.frame.midX - 110, y: s.frame.maxY - 6, width: 220, height: 10)
+    }
+
+    /// Converts a screen rect to the top-left coordinates of a window covering `s`.
+    private func local(_ r: NSRect, in s: NSScreen) -> CGRect {
+        CGRect(x: r.minX - s.frame.minX, y: s.frame.maxY - r.maxY, width: r.width, height: r.height)
     }
 
     private func tick() {
@@ -938,21 +1384,22 @@ final class KeyWindow: NSWindow {
         guard spotlight == nil, let screen = notchScreen() else { return }
         let p = NSEvent.mouseLocation
         let hot = hotZone(screen)
-        if panelShown {
-            let inside = (panel?.frame.insetBy(dx: -8, dy: -8).contains(p) ?? false) || hot.contains(p)
+        if panelOpen {
+            let inside = openRect.insetBy(dx: -8, dy: -8).contains(p) || hot.contains(p)
             if inside { leaveStart = nil }
             else if let s = leaveStart { if Date().timeIntervalSince(s) > 0.35 { hidePanel() } }
             else { leaveStart = Date() }
         } else if hot.contains(p) && Date() > cooldownUntil {
-            if let s = hoverStart { if Date().timeIntervalSince(s) > 0.3 { showPanel(on: screen) } }
-            else { hoverStart = Date() }
-        } else {
+            if let s = hoverStart { if Date().timeIntervalSince(s) > Theme.dwell { openPanel(on: screen) } }
+            else { hoverStart = Date(); peek(on: screen) }
+        } else if hoverStart != nil {
             hoverStart = nil
+            unpeek()
         }
     }
 
     private func updateTimer() {
-        let needed = spotlight == nil && (panelShown || hoverStart != nil)
+        let needed = spotlight == nil && (panelOpen || hoverStart != nil)
         if needed, timer == nil {
             let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.tick() }
@@ -965,12 +1412,20 @@ final class KeyWindow: NSWindow {
         }
     }
 
-    private func showPanel(on screen: NSScreen) {
+    // MARK: Notch panel
+
+    private func preparePanel(on screen: NSScreen) {
         let nh = notchHeight(screen)
+        let notch = notchRect(screen)
         let cards = CGFloat(categories.count + 1 + (Favorites.shared.items.isEmpty ? 0 : 1))
-        let w = min(max(cards * cardWidth + (cards - 1) * cardSpacing + 36, 640), screen.frame.width - 40)
-        let h: CGFloat = nh + 172
-        let frame = NSRect(x: hotZone(screen).midX - w / 2, y: screen.frame.maxY - h, width: w, height: h)
+        let w = min(max(cards * cardWidth + (cards - 1) * cardSpacing + 36, 640), screen.frame.width - 80)
+        let h = nh + 172
+        state.notchSize = CGSize(width: notch.width, height: screen.safeAreaInsets.top)
+        state.panelSize = CGSize(width: w, height: h)
+        state.notchHeight = nh
+        openRect = NSRect(x: notch.midX - w / 2, y: screen.frame.maxY - h, width: w, height: h)
+        let margin: CGFloat = 40  // room for the glow
+        let frame = NSRect(x: openRect.minX - margin, y: openRect.minY - margin, width: w + margin * 2, height: h + margin)
         if panel == nil {
             let p = NSPanel(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             p.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
@@ -981,40 +1436,78 @@ final class KeyWindow: NSWindow {
             p.hidesOnDeactivate = false
             p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
             let hv = FirstMouseHostingView(rootView: NotchGalleryView(
-                state: state, notchHeight: nh,
-                onPick: { [weak self] c in self?.openSpotlight(c) },
-                onBoost: { [weak self] in self?.openBoost() },
+                state: state,
+                onPick: { [weak self] c, r in self?.pick(c, from: r) },
                 onAbout: { [weak self] in self?.openResearch() }))
             hv.sizingOptions = []
             p.contentView = hv
             panel = p
         }
-        panel?.setFrame(frame, display: true)
-        panelShown = true
+        panel?.setFrame(frame, display: false)
+    }
+
+    private func peek(on screen: NSScreen) {
+        preparePanel(on: screen)
+        panel?.ignoresMouseEvents = true
+        panel?.orderFrontRegardless()
+        withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) { state.phase = .peek }
+    }
+
+    private func unpeek() {
+        guard state.phase == .peek else { return }
+        withAnimation(.easeIn(duration: 0.15)) { state.phase = .hidden }
+        orderOutPanel(after: 0.2)
+    }
+
+    private func openPanel(on screen: NSScreen) {
+        if state.phase != .peek {
+            preparePanel(on: screen)
+            panel?.orderFrontRegardless()
+        }
         hoverStart = nil
         leaveStart = nil
-        state.expanded = false
-        panel?.orderFrontRegardless()
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 16_000_000)
-            guard let self, self.panelShown else { return }
-            withAnimation(.spring(response: 0.35, dampingFraction: 0.78)) { self.state.expanded = true }
-        }
+        panel?.ignoresMouseEvents = false
+        withAnimation(Theme.reduceMotion ? .easeOut(duration: 0.15) : Theme.open) { state.phase = .open }
         refreshThumbs()
         warm()
     }
 
     private func hidePanel() {
-        guard panelShown else { return }
-        panelShown = false
+        guard panelOpen else { return }
         leaveStart = nil
         hoverStart = nil
-        withAnimation(.easeIn(duration: 0.16)) { state.expanded = false }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 180_000_000)
-            guard let self, !self.panelShown else { return }
+        panel?.ignoresMouseEvents = true
+        withAnimation(Theme.reduceMotion ? .easeIn(duration: 0.12) : Theme.settle) { state.phase = .hidden }
+        orderOutPanel(after: 0.35)
+    }
+
+    /// A pink pulse around the notch when a Focus Boost lands back in it.
+    private func glowNotch() {
+        guard let screen = notchScreen() else { return }
+        preparePanel(on: screen)
+        panel?.ignoresMouseEvents = true
+        panel?.orderFrontRegardless()
+        withAnimation(.easeOut(duration: 0.25)) { state.phase = .glow }
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(0.9))
+            guard let self, self.state.phase == .glow else { return }
+            withAnimation(.easeIn(duration: 0.6)) { self.state.phase = .hidden }
+            self.orderOutPanel(after: 0.65)
+        }
+    }
+
+    private func orderOutPanel(after secs: Double) {
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(secs))
+            guard let self, self.state.phase == .hidden else { return }
             self.panel?.orderOut(nil)
         }
+    }
+
+    private func pick(_ c: CuteCategory, from r: CGRect?) {
+        Theme.haptic()
+        let origin = r.flatMap { r in panel.map { NSRect(x: $0.frame.minX + r.minX, y: $0.frame.maxY - r.maxY, width: r.width, height: r.height) } }
+        if c.id == boostCategory.id { openBoost(from: origin) } else { openSpotlight(c, from: origin) }
     }
 
     // MARK: Background feeds and card thumbnails
@@ -1055,19 +1548,22 @@ final class KeyWindow: NSWindow {
 
     // MARK: Overlays
 
-    func openSpotlight(_ c: CuteCategory) { openPlayer(PlayerModel(category: c)) }
+    func openSpotlight(_ c: CuteCategory, from origin: NSRect? = nil) { openPlayer(PlayerModel(category: c), from: origin) }
 
-    func openBoost() { openPlayer(PlayerModel(category: boostCategory, boostLength: Prefs.boostSeconds)) }
+    func openBoost(from origin: NSRect? = nil) {
+        openPlayer(PlayerModel(category: boostCategory, boostLength: Prefs.boostSeconds), from: origin)
+    }
 
     func toggleBoost() { if spotlight != nil { closeSpotlight() } else { openBoost() } }
 
-    private func openPlayer(_ m: PlayerModel) {
+    private func openPlayer(_ m: PlayerModel, from origin: NSRect?) {
         m.onBoostDone = { [weak self, weak m] in
             guard let self, let m, self.model === m else { return }
-            self.closeSpotlight()
+            self.closeSpotlight(glow: true)
         }
-        presentOverlay(maxSize: CGSize(width: 880, height: 680), content: { [weak self] size in
-            SpotlightView(model: m, cardSize: size,
+        m.onBoostTick = { [weak self] left in self?.statusTick?(left) }
+        let ov = presentOverlay(from: origin, maxSize: CGSize(width: 880, height: 680), content: { [weak self] _ in
+            SpotlightView(model: m,
                           close: { self?.closeSpotlight() },
                           open: { url in self?.closeSpotlight(); NSWorkspace.shared.open(url) })
         }, keys: { [weak self] code in
@@ -1078,19 +1574,20 @@ final class KeyWindow: NSWindow {
             case 123: m.prev()
             case 49: m.togglePause()
             case 46: m.muted.toggle()
-            case 3: if let i = m.current { Favorites.shared.toggle(i) }
+            case 3: m.toggleFavorite()
             case 31: if let p = m.current?.permalink { self.closeSpotlight(); NSWorkspace.shared.open(p) }
             default: return false
             }
             return true
         })
+        m.onTint = { [weak ov] c in ov?.setTint(c) }
         model = m
         m.load()
     }
 
     func openResearch() {
-        presentOverlay(maxSize: CGSize(width: 640, height: 640), content: { [weak self] size in
-            ResearchView(cardSize: size, close: { self?.closeSpotlight() })
+        presentOverlay(from: nil, maxSize: CGSize(width: 640, height: 640), content: { [weak self] _ in
+            ResearchView(close: { self?.closeSpotlight() })
         }, keys: { [weak self] code in
             guard code == 53 else { return false }
             self?.closeSpotlight()
@@ -1098,12 +1595,15 @@ final class KeyWindow: NSWindow {
         })
     }
 
-    private func presentOverlay<V: View>(maxSize: CGSize, content: (CGSize) -> V, keys: @escaping @MainActor (UInt16) -> Bool) {
+    @discardableResult
+    private func presentOverlay<V: View>(from origin: NSRect?, maxSize: CGSize, content: (CGSize) -> V,
+                                         keys: @escaping @MainActor (UInt16) -> Bool) -> OverlayState? {
         hidePanel()
         if spotlight != nil { closeSpotlight() }
-        guard let screen = overlayScreen() else { return }
+        guard let screen = overlayScreen() else { return nil }
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() { previousApp = front }
         let size = CGSize(width: min(maxSize.width, screen.frame.width - 80), height: min(maxSize.height, screen.frame.height - 120))
+        let ov = OverlayState(origin: local(origin ?? notchRect(screen), in: screen))
         let w = KeyWindow(contentRect: screen.frame, styleMask: [.borderless], backing: .buffered, defer: false)
         w.setFrame(screen.frame, display: false)
         w.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 2)
@@ -1112,41 +1612,44 @@ final class KeyWindow: NSWindow {
         w.hasShadow = false
         w.isReleasedWhenClosed = false
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let hv = FirstMouseHostingView(rootView: content(size))
+        let hv = FirstMouseHostingView(rootView: Presented(overlay: ov, cardSize: size, close: { [weak self] in self?.closeSpotlight() }, content: content(size)))
         hv.sizingOptions = []
         w.contentView = hv
-        w.alphaValue = 0
         spotlight = w
+        overlay = ov
         updateTimer()
         NSApp.activate()
         w.makeKeyAndOrderFront(nil)
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.25
-            w.animator().alphaValue = 1
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(16))
+            withAnimation(Theme.reduceMotion ? .easeOut(duration: 0.2) : Theme.open) { ov.presented = true }
         }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { e in
             if !e.modifierFlags.intersection([.command, .control, .option]).isEmpty { return e }
             let code = e.keyCode
             return MainActor.assumeIsolated { keys(code) } ? nil : e
         }
+        return ov
     }
 
-    func closeSpotlight() {
+    /// Shrinks the card back into the notch; after a finished Focus Boost the notch glows as it lands.
+    func closeSpotlight(glow: Bool = false) {
         if let k = keyMonitor { NSEvent.removeMonitor(k); keyMonitor = nil }
         model?.stop()
         model = nil
+        statusTick?(nil)
         cooldownUntil = Date().addingTimeInterval(1.0)
-        guard let w = spotlight else { return }
+        guard let w = spotlight, let ov = overlay else { return }
         spotlight = nil
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.18
-            w.animator().alphaValue = 0
-        }, completionHandler: {
-            MainActor.assumeIsolated {
-                w.contentView = nil
-                w.orderOut(nil)
-            }
-        })
+        overlay = nil
+        if let s = w.screen { ov.origin = local(notchRect(s), in: s) }
+        withAnimation(Theme.reduceMotion ? .easeIn(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.9)) { ov.presented = false }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(380))
+            w.contentView = nil
+            w.orderOut(nil)
+            if glow { self?.glowNotch() }
+        }
         previousApp?.activate(options: [])
     }
 }
@@ -1188,12 +1691,25 @@ final class HotKey {
     func applicationDidFinishLaunching(_ notification: Notification) {
         controller.start()
         let si = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        si.button?.title = "🐾"
+        if let b = si.button {
+            b.image = NSImage(systemSymbolName: "pawprint.fill", accessibilityDescription: "NotchCute")
+            b.image?.isTemplate = true
+            b.imagePosition = .imageLeading
+        }
         let menu = NSMenu()
         menu.delegate = self
         si.menu = menu
         statusItem = si
+        controller.statusTick = { [weak self] left in self?.showCountdown(left) }
         hotKey = HotKey(keyCode: kVK_ANSI_C, modifiers: controlKey | optionKey) { [weak self] in self?.controller.toggleBoost() }
+    }
+
+    /// During a Focus Boost the paw carries the time left.
+    private func showCountdown(_ left: TimeInterval?) {
+        guard let b = statusItem?.button else { return }
+        let text = left.map { " " + clock($0) } ?? ""
+        guard b.title != text else { return }
+        b.attributedTitle = NSAttributedString(string: text, attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)])
     }
 
     /// Rebuilt on every open so Favorites, Launch at Login and the boost length stay current.
